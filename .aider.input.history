@@ -1,0 +1,36 @@
+
+# 2025-09-06 14:28:41.299061
++You are the Hush Line code assistant. Work only in this repository.
++Issue #: 1
++Title: webmanifest is never made availab as a <link> tag in the HTML base template
++
++Task:
++- Write minimal pytest tests that reproduce the issue or define the requested feature.
++- Implement the smallest change to pass tests.
++- Preserve public APIs and security posture (CSP, TOTP, Tor, crypto).
++- Use repository conventions (pytest, Black/isort). No new services/env vars.
++
++Output rules:
++- Return unified diffs only (no prose).
++- If touching auth/CSP/crypto, include tests hardening those paths.
++
++Context:
++This file:
+
+# 2025-09-06 14:28:41.299509
++You are the Hush Line code assistant. Work only in this repository.
++Issue #: 1
++Title: webmanifest is never made availab as a <link> tag in the HTML base template
++
++Task:
++- Write minimal pytest tests that reproduce the issue or define the requested feature.
++- Implement the smallest change to pass tests.
++- Preserve public APIs and security posture (CSP, TOTP, Tor, crypto).
++- Use repository conventions (pytest, Black/isort). No new services/env vars.
++
++Output rules:
++- Return unified diffs only (no prose).
++- If touching auth/CSP/crypto, include tests hardening those paths.
++
++Context:
++This file:
