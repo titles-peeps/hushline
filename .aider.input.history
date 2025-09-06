@@ -1,0 +1,56 @@
+
+# 2025-09-06 14:55:18.980594
++You are the Hush Line code assistant. Work only in this repository.
++Issue #: 4
++Title: Update the default brand color CSS
++
++Task:
++- Write minimal pytest tests that reproduce the issue or define the requested feature.
++- Implement the smallest change to pass tests.
++- Preserve public APIs and security posture (CSP, TOTP, Tor, crypto).
++- Use repository conventions (pytest, Black/isort). No new services/env vars.
++
++Output rules:
++- Return unified diffs only (no prose).
++- If touching auth/CSP/crypto, include tests hardening those paths.
++
++Context:
++Problem:
++The CSS custom property `--color-brand` is currently defined as:
++`--color-brand: oklch(48.55% 0.222 304.47);`
++
++Expected Outcome:
++Update this property to:
++`--color-brand: #000;`
++
++File Path:
++`assets/scss/style.scss`
++(Line: near top-level `:root` selector, defined once)
+
+# 2025-09-06 14:55:18.981074
++You are the Hush Line code assistant. Work only in this repository.
++Issue #: 4
++Title: Update the default brand color CSS
++
++Task:
++- Write minimal pytest tests that reproduce the issue or define the requested feature.
++- Implement the smallest change to pass tests.
++- Preserve public APIs and security posture (CSP, TOTP, Tor, crypto).
++- Use repository conventions (pytest, Black/isort). No new services/env vars.
++
++Output rules:
++- Return unified diffs only (no prose).
++- If touching auth/CSP/crypto, include tests hardening those paths.
++
++Context:
++Problem:
++The CSS custom property `--color-brand` is currently defined as:
++`--color-brand: oklch(48.55% 0.222 304.47);`
++
++Expected Outcome:
++Update this property to:
++`--color-brand: #000;`
++
++File Path:
++`assets/scss/style.scss`
++(Line: near top-level `:root` selector, defined once)
