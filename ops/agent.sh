@@ -1,100 +1,153 @@
-# (paste the full script above)
 #!/usr/bin/env bash
 set -euo pipefail
+set -x
 
-ISSUE="${1:-}"
-if [[ -z "$ISSUE" ]]; then
-  echo "Usage: $0 <issue-number>"
-  exit 1
+# usage: ops/agent.sh <issue_number>
+if [[ $# -ne 1 ]]; then
+  echo "usage: ops/agent.sh <issue_number>" >&2
+  exit 2
 fi
 
-# Detect repo from origin remote
-REPO="${REPO:-$(git remote get-url origin | sed -E 's#(git@|https://)github.com[:/](.+)\.git#\2#')}"
-: "${REPO:=titles-peeps/hushline}"
+ISSUE="$1"
 
-# Environment setup
-unset LITELLM_PROVIDER LITELLM_OLLAMA_BASE OPENAI_API_KEY ANTHROPIC_API_KEY
+# --- Repo autodetect (owner/repo) with safe fallback ---
+if REPO_URL="$(git config --get remote.origin.url 2>/dev/null)"; then
+  case "$REPO_URL" in
+    git@github.com:*.git) REPO="${REPO_URL#git@github.com:}"; REPO="${REPO%.git}";;
+    https://github.com/*) REPO="${REPO_URL#https://github.com/}"; REPO="${REPO%.git}";;
+    *) REPO="${REPO:-titles-peeps/hushline}";;
+  esac
+else
+  REPO="${REPO:-titles-peeps/hushline}"
+fi
+
+# --- Auth / tokens ---
+: "${GH_TOKEN:?GH_TOKEN must be set in env}"
+export GITHUB_TOKEN="$GH_TOKEN"
+
+# --- Keep Ollama tame on small boxes ---
 export OLLAMA_API_BASE="${OLLAMA_API_BASE:-http://127.0.0.1:11434}"
-MODEL="ollama_chat/qwen2.5-coder:7b-instruct"
+export OLLAMA_HOST="${OLLAMA_HOST:-http://127.0.0.1:11434}"
+export OLLAMA_NUM_PARALLEL="${OLLAMA_NUM_PARALLEL:-1}"
+export OLLAMA_KEEP_ALIVE="${OLLAMA_KEEP_ALIVE:-10m}"
+export OLLAMA_NUM_CTX="${OLLAMA_NUM_CTX:-2048}"
+# Optional: smaller GPU footprint
+export OLLAMA_KV_CACHE_TYPE="${OLLAMA_KV_CACHE_TYPE:-cpu}"
 
-# Pre-flight Ollama health check
-if ! curl -s --max-time 5 "$OLLAMA_API_BASE/api/version" >/dev/null; then
-  echo "Ollama not reachable at $OLLAMA_API_BASE"
-fi
+# Aider should talk to Ollama directly (avoid LiteLLM indirection)
+unset LITELLM_PROVIDER LITELLM_OLLAMA_BASE OPENAI_API_KEY ANTHROPIC_API_KEY
 
-# Ensure repo root
+MODEL="${AIDER_MODEL:-ollama_chat/qwen2.5-coder:7b-instruct}"
+
+# --- Sanity checks ---
+for bin in gh git aider curl jq; do
+  command -v "$bin" >/dev/null || { echo "missing dependency: $bin"; exit 1; }
+done
+
 [[ -d .git ]] || { echo "must run in repo root"; exit 1; }
+[[ -f ops/agent_prompt.tmpl ]] || { echo "missing ops/agent_prompt.tmpl"; exit 1; }
 
-# Git identity
+# Git identity (local-only; workflow usually sets this too)
 git config user.name  >/dev/null 2>&1 || git config user.name  "hushline-agent"
 git config user.email >/dev/null 2>&1 || git config user.email "agent@users.noreply.github.com"
 
-# Fetch issue
-ISSUE_TITLE="$(gh issue view "$ISSUE" -R "$REPO" --json title -q '.title')"
-ISSUE_BODY="$(gh issue view "$ISSUE" -R "$REPO" --json body  -q '.body')"
+# --- Fail fast if Ollama is unhappy; also pull model if absent ---
+set +e
+curl -fsS "$OLLAMA_API_BASE/api/tags" | jq -r '.models[].name' >/dev/null
+RC=$?
+set -e
+if [[ $RC -ne 0 ]]; then
+  echo "Ollama not responding; aborting early"
+  exit 1
+fi
 
-# Default branch
+# Ensure the model is locally available
+if ! curl -fsS "$OLLAMA_API_BASE/api/tags" | jq -e --arg m "qwen2.5-coder:7b-instruct" '.models[].name | contains($m)' >/dev/null 2>&1; then
+  curl -fsS "$OLLAMA_API_BASE/api/pull" \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"qwen2.5-coder:7b-instruct"}' >/dev/null
+fi
+
+# --- Get issue text (full body with newlines preserved) ---
+ISSUE_TITLE="$(gh issue view "$ISSUE" -R "$REPO" --json title -q .title)"
+ISSUE_BODY="$(gh issue view "$ISSUE" -R "$REPO" --json body  -q .body)"
+
+# --- Default branch detection ---
 DEFAULT_BRANCH="$(gh repo view "$REPO" --json defaultBranchRef -q .defaultBranchRef.name 2>/dev/null || true)"
-: "${DEFAULT_BRANCH:=main}"
+[[ -z "$DEFAULT_BRANCH" ]] && DEFAULT_BRANCH="$(git remote show origin 2>/dev/null | sed -n 's/.*HEAD branch: //p' || true)"
+[[ -z "$DEFAULT_BRANCH" ]] && DEFAULT_BRANCH="main"
 
-# New branch
+# --- New working branch from origin/<default> ---
 BR="agent/issue-${ISSUE}-$(date +%Y%m%d-%H%M%S)"
 git fetch origin --prune
 git checkout -B "$BR" "origin/$DEFAULT_BRANCH"
 
-# Prompt for aider
-cat > /tmp/agent_prompt.txt <<EOF
-Issue #$ISSUE: $ISSUE_TITLE
+# --- Build the prompt from template ---
+export ISSUE_NUMBER="$ISSUE" ISSUE_TITLE ISSUE_BODY
+envsubst < ops/agent_prompt.tmpl > /tmp/agent_prompt.txt
 
-$ISSUE_BODY
-EOF
+# --- Try to narrow files passed to aider (generic extensions) ---
+TARGET_FILES=()
+while IFS= read -r f; do
+  [[ -f "$f" ]] && TARGET_FILES+=("$f")
+done < <(
+  printf '%s\n' "$ISSUE_BODY" |
+    grep -Eo '([A-Za-z0-9._/-]+\.(py|js|jsx|ts|tsx|css|scss|sass|html|jinja|jinja2|sh|yml|yaml|toml|json|md|ini|cfg))' |
+    sort -u
+)
 
+# --- Aider args: no playwright, short timeouts, tiny map ---
 AIDER_ARGS=(
   --yes
   --no-gitignore
   --model "$MODEL"
   --edit-format udiff
-  --timeout 480
+  --timeout 60
   --no-stream
-  --map-tokens 512
-  --max-chat-history-tokens 1024
+  --disable-playwright
+  --map-refresh files
+  --map-multiplier-no-files 0
+  --map-tokens 256
+  --max-chat-history-tokens 512
 )
 
-# Run aider
-set +e
-timeout -k 10 600 aider "${AIDER_ARGS[@]}" --message "$(cat /tmp/agent_prompt.txt)"
-rc=$?
-set -e
-
-# Check changes
-if git diff --quiet; then
-  echo "No changes from aider, trying fallback"
-
-  TARGET_FILES=$(grep -Eo '([A-Za-z0-9._/-]+\.(css|scss|py|ts|js|yml|yaml|html|sh))' <<<"$ISSUE_BODY" || true)
-  OLD=$(echo "$ISSUE_BODY" | sed -n '/Problem:/,/Expected Outcome:/p' | sed -n 's/.*`$begin:math:text$.*$end:math:text$`.*/\1/p' | head -1)
-  NEW=$(echo "$ISSUE_BODY" | sed -n '/Expected Outcome:/,/Path to file:/p' | sed -n 's/.*`$begin:math:text$.*$end:math:text$`.*/\1/p' | head -1)
-
-  if [[ -n "$TARGET_FILES" && -n "$OLD" && -n "$NEW" ]]; then
-    for f in $TARGET_FILES; do
-      if [[ -f "$f" ]] && grep -qF "$OLD" "$f"; then
-        sed -i "s|$OLD|$NEW|g" "$f"
-        echo "Applied fallback patch in $f"
-      fi
-    done
-  fi
-fi
-
-# Commit if changes exist
-if ! git diff --quiet; then
-  git add -u
-  git commit -m "agent: resolve #$ISSUE – $ISSUE_TITLE"
-  git push -u origin "$BR"
-
-  if ! gh pr list -R "$REPO" --head "$BR" --json number -q '.[0].number' >/dev/null; then
-    gh pr create -R "$REPO" --head "$BR" --base "$DEFAULT_BRANCH" --title "[Agent] $ISSUE_TITLE (#$ISSUE)" --body "Automated changes for issue #$ISSUE"
+run_aider() {
+  if [[ ${#TARGET_FILES[@]} -gt 0 ]]; then
+    nice -n 10 ionice -c2 -n7 timeout -k 10 420 aider "${AIDER_ARGS[@]}" \
+      --message "$(cat /tmp/agent_prompt.txt)" "${TARGET_FILES[@]}" || true
   else
-    gh pr comment -R "$REPO" "$ISSUE" --body "Agent updated branch $BR for issue #$ISSUE"
+    nice -n 10 ionice -c2 -n7 timeout -k 10 420 aider "${AIDER_ARGS[@]}" \
+      --message "$(cat /tmp/agent_prompt.txt)" || true
   fi
-else
-  gh issue comment -R "$REPO" "$ISSUE" --body "Agent found no changes to make."
+}
+
+# --- First and only pass (Path B keeps it simple) ---
+run_aider
+
+# --- Early exit if aider produced nothing (both staged & unstaged) ---
+if git diff --quiet && git diff --cached --quiet; then
+  if [[ ${#TARGET_FILES[@]} -gt 0 ]]; then
+    gh issue comment "$ISSUE" -R "$REPO" -b "Agent attempted patch but produced no changes to: ${TARGET_FILES[*]}."
+  else
+    gh issue comment "$ISSUE" -R "$REPO" -b "Agent attempted patch but produced no changes."
+  fi
+  exit 0
 fi
+
+# --- Commit & push (no lint/tests in Path B) ---
+git add -A
+git commit -m "Agent patch for #${ISSUE}: ${ISSUE_TITLE}"
+git push -u origin "$BR"
+
+# --- PR create/update ---
+EXISTING_PR="$(gh pr list -R "$REPO" --head "$BR" --json number -q '.[0].number')"
+if [[ -z "$EXISTING_PR" ]]; then
+  gh pr create -R "$REPO" \
+    -t "Agent patch for #${ISSUE}: ${ISSUE_TITLE}" \
+    -b "Automated patch for #${ISSUE}."
+else
+  gh pr comment -R "$REPO" "$EXISTING_PR" -b "Updated patch."
+fi
+
+# --- Link back to issue ---
+gh issue comment "$ISSUE" -R "$REPO" -b "Agent created/updated PR from branch \`$BR\`."

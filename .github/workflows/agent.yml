@@ -1,64 +1,92 @@
-name: Agent
+name: run-agent
 
 on:
+  # Manual run: choose an issue number
   workflow_dispatch:
     inputs:
       issue:
-        description: "Issue number to run agent on"
+        description: "Issue number to work on"
         required: true
+        type: string
+  # Auto-run when an issue is labeled "agent"
   issues:
     types: [labeled]
 
-permissions:
-  contents: write
-  pull-requests: write
-  issues: write
-
-concurrency:
-  group: agent-${{ github.ref }}
-  cancel-in-progress: false
-
 jobs:
-  run-agent:
-    if: github.event_name == 'workflow_dispatch' || (github.event.label.name == 'agent')
+  run:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issues' && github.event.label.name == 'agent')
     runs-on: self-hosted
+
     env:
-      REPO: ${{ github.repository }}
-      ISSUE: ${{ github.event.inputs.issue || github.event.issue.number }}
-      GITHUB_TOKEN: ${{ secrets.AGENT_TOKEN }}
+      # Python/Flask tests are disabled in this “B” path, but keep envs tidy
+      DATABASE_URL: sqlite:///./test.db
+      FLASK_ENV: test
+
+      # Aider/Ollama knobs to keep memory/CPU in check
+      OLLAMA_API_BASE: http://127.0.0.1:11434
+      OLLAMA_HOST: http://127.0.0.1:11434
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_KEEP_ALIVE: 10m
+      # shrink KV context footprint
+      OLLAMA_NUM_CTX: "2048"
+      # optional: keep cache on CPU instead of VRAM (helps on tiny GPUs)
+      OLLAMA_KV_CACHE_TYPE: "cpu"
+
+      # Pass the GitHub token to the script as GH_TOKEN
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Show context
-        run: |
-          echo "Repository: $REPO"
-          echo "Issue: $ISSUE"
-          uname -a
-          free -h
-          df -h
-
-      - name: Tool versions
-        run: |
-          git --version
-          gh --version
-          aider --version || true
-          curl -s http://127.0.0.1:11434/api/version || echo "Ollama not responding"
-
-      - name: Run agent script (verbose)
-        run: |
-          set -x
-          bash ./ops/agent.sh "$ISSUE" 2>&1 | tee agent-run.log
-
-      - name: Upload run log
-        uses: actions/upload-artifact@v4
         with:
-          name: agent-run-log
-          path: agent-run.log
+          persist-credentials: true
+          fetch-depth: 0
 
-      - name: Upload aider history
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: aider-history
-          path: .aider.input.history
+      - name: Set Git ident (CI)
+        run: |
+          git config user.name  "hushline-agent"
+          git config user.email "agent@users.noreply.github.com"
+
+      - name: Install OS deps (jq, curl)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends jq curl
+
+      - name: Ensure Python available (no tests in Path B, but keep venv ready)
+        run: |
+          python3 -V
+          python3 -m venv .venv
+          . .venv/bin/activate
+          python -V
+
+      - name: Warm Ollama model
+        env:
+          OLLAMA_API_BASE: ${{ env.OLLAMA_API_BASE }}
+        run: |
+          set -e
+          curl -fsS "$OLLAMA_API_BASE/api/pull" \
+            -H 'Content-Type: application/json' \
+            -d '{"model":"qwen2.5-coder:7b-instruct"}' >/dev/null
+          curl -fsS "$OLLAMA_API_BASE/api/generate" \
+            -H 'Content-Type: application/json' \
+            -d '{"model":"qwen2.5-coder:7b-instruct","prompt":"ping","stream":false}' >/dev/null
+
+      - name: Run agent (simple, no lint/tests)
+        env:
+          GH_TOKEN: ${{ env.GH_TOKEN }}
+          OLLAMA_API_BASE: ${{ env.OLLAMA_API_BASE }}
+          OLLAMA_HOST: ${{ env.OLLAMA_HOST }}
+          OLLAMA_NUM_PARALLEL: ${{ env.OLLAMA_NUM_PARALLEL }}
+          OLLAMA_KEEP_ALIVE: ${{ env.OLLAMA_KEEP_ALIVE }}
+          OLLAMA_NUM_CTX: ${{ env.OLLAMA_NUM_CTX }}
+          OLLAMA_KV_CACHE_TYPE: ${{ env.OLLAMA_KV_CACHE_TYPE }}
+        run: |
+          set -e
+          ISSUE_NUM="${{ github.event.inputs.issue || github.event.issue.number }}"
+          if [[ -z "$ISSUE_NUM" ]]; then
+            echo "No issue number provided"; exit 2
+          fi
+          # lower CPU/io priority so the runner stays responsive
+          nice -n 10 ionice -c2 -n7 ./ops/agent.sh "$ISSUE_NUM"
