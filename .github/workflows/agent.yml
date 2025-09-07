@@ -1,35 +1,33 @@
-name: run-agent
-
+name: Agent Automation
 on:
   issues:
     types: [labeled]
 
 jobs:
-  agent:
-    # only run when the issue gets the "agent" label
-    if: contains(github.event.label.name, 'agent')
-    runs-on: self-hosted
-
+  run-agent:
+    # Only run if the label added is exactly 'agent'
+    if: ${{ github.event.label.name == 'agent' }}
+    runs-on: self-hosted  # Jetson Orin Nano runner
+    container:
+      image: ubuntu:22.04
+      # Mount the local Ollama model directory into the container
+      options: --mount type=bind,source=/home/ubuntu/.ollama,target=/root/.ollama
+    # Ensure the workflow can push code and create PRs
     permissions:
-      contents: write
-      pull-requests: write
-      issues: write
-
-    env:
-      # required token (name unchanged)
-      GH_TOKEN: ${{ secrets.AGENT_TOKEN }}
-      # <-- this is the missing piece
-      ISSUE_NUM: ${{ github.event.issue.number }}
-      # keep your local Ollama endpoint
-      OLLAMA_API_BASE: http://127.0.0.1:11434
-      # do not override your model here if you’ve set it elsewhere
-      # AIDER_MODEL: ollama_chat/qwen2.5-coder:7b-instruct
-
+      contents: write    # to push branches
+      issues: write      # to read issue contents (if needed) and comment/close
+      pull-requests: write  # to create pull requests
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v3
 
-      - name: Run agent
-        shell: bash
+      - name: Install system dependencies
         run: |
-          bash ops/agent.sh "$ISSUE_NUM"
+          apt-get update && apt-get install -y --no-install-recommends \
+            git jq python3-pip
+          pip3 install --no-cache-dir black isort jq
+
+      - name: Run agent script
+        run: bash ops/agent.sh
+        env:
+          AGENT_TOKEN: ${{ secrets.AGENT_TOKEN }}
