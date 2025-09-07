@@ -9,115 +9,90 @@ fi
 
 ISSUE="$1"
 
-# --- minimal env & deps ---
-: "${GH_TOKEN:?GH_TOKEN missing}"
+# --- config (minimal) ---
+REPO="${REPO:-$(git remote get-url origin 2>/dev/null | sed -nE 's#.*/([^/]+/[^/.]+)(\.git)?$#\1#p')}"
+REPO="${REPO:-titles-peeps/hushline}"
+
+# Required: GH_TOKEN must be provided by workflow secrets
+: "${GH_TOKEN:?GH_TOKEN is required}"
 export GITHUB_TOKEN="$GH_TOKEN"
 
-for b in gh git perl; do
-  command -v "$b" >/dev/null || { echo "missing dependency: $b"; exit 1; }
-done
+# Aider+Ollama
+export OLLAMA_API_BASE="${OLLAMA_API_BASE:-http://127.0.0.1:11434}"
+AIDER_MODEL="${AIDER_MODEL:-ollama_chat/qwen2.5-coder:7b-instruct}"
 
-# --- repo & branch ---
-REPO="$(git config --get remote.origin.url | sed -E 's#.*[:/](.+/.+)\.git#\1#')"
-[[ -z "$REPO" ]] && REPO="titles-peeps/hushline"
+# Make Aider as gentle as possible
+AIDER_ARGS=(
+  --yes
+  --no-gitignore
+  --model "$AIDER_MODEL"
+  --edit-format udiff
+  --timeout 60
+  --no-stream
+  --map-refresh files
+  --map-multiplier-no-files 0
+  --map-tokens 256
+  --max-chat-history-tokens 512
+  --disable-playwright
+)
 
+# --- ensure we’re in a repo root ---
+[[ -d .git ]] || { echo "run from repo root"; exit 1; }
+[[ -f ops/agent_prompt.tmpl ]] || { echo "missing ops/agent_prompt.tmpl"; exit 1; }
+
+# --- light Ollama warmup (don’t hang if down) ---
+curl -fsS "$OLLAMA_API_BASE/api/tags" >/dev/null || true
+
+# --- fetch issue data (preserve newlines) ---
+ISSUE_TITLE="$(gh issue view "$ISSUE" -R "$REPO" --json title -q .title)"
+ISSUE_BODY="$(gh issue view "$ISSUE" -R "$REPO" --json body  -q .body)"
+
+# --- base branch & working branch ---
 DEFAULT_BRANCH="$(gh repo view "$REPO" --json defaultBranchRef -q .defaultBranchRef.name 2>/dev/null || true)"
-[[ -z "$DEFAULT_BRANCH" ]] && DEFAULT_BRANCH="main"
+DEFAULT_BRANCH="${DEFAULT_BRANCH:-$(git remote show origin 2>/dev/null | sed -n 's/.*HEAD branch: //p')}"
+DEFAULT_BRANCH="${DEFAULT_BRANCH:-main}"
 
-git fetch origin --prune
 BR="agent/issue-${ISSUE}-$(date +%Y%m%d-%H%M%S)"
-git checkout -B "$BR" "origin/${DEFAULT_BRANCH}"
+git fetch origin --prune
+git checkout -B "$BR" "origin/$DEFAULT_BRANCH"
 
-# Ensure git identity
-git config user.name  >/dev/null 2>&1 || git config user.name  "hushline-agent"
-git config user.email >/dev/null 2>&1 || git config user.email "agent@users.noreply.github.com"
+# --- build prompt for the LLM ---
+export ISSUE_NUMBER="$ISSUE" ISSUE_TITLE ISSUE_BODY
+envsubst < ops/agent_prompt.tmpl > /tmp/agent_prompt.txt
 
-# --- get issue text ---
-TITLE="$(gh issue view "$ISSUE" -R "$REPO" --json title -q .title)"
-BODY_FILE="$(mktemp)"
-gh issue view "$ISSUE" -R "$REPO" --json body -q .body > "$BODY_FILE"
+# If the issue mentions paths, pass those files to Aider (keeps repo-map small)
+TARGET_FILES=()
+while IFS= read -r f; do
+  [[ -f "$f" ]] && TARGET_FILES+=("$f")
+done < <(printf '%s\n' "$ISSUE_BODY" | grep -Eo '([A-Za-z0-9._/-]+\.(py|js|ts|tsx|jsx|css|scss|sass|html|jinja2|yml|yaml|toml|json|md|sh))' | sort -u)
 
-trim() { sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
-
-# --- resolve target file ---
-# 1) Prefer "Path to file: <path>" or "Path to file:\n`<path>`"
-FILE="$(awk '
-  BEGIN{ IGNORECASE=1; found=0 }
-  /^Path[[:space:]]+to[[:space:]]+file:/ { 
-    sub(/^Path[[:space:]]+to[[:space:]]+file:[[:space:]]*/,"");
-    gsub(/`/,"");
-    print; found=1; exit
-  }' "$BODY_FILE" | head -n1 | tr -d "\r" | sed "s/^ *//; s/ *$//")"
-
-# 2) If not found, pick first token that looks like a path and exists
-if [[ -z "${FILE:-}" ]]; then
-  while IFS= read -r cand; do
-    if [[ -f "$cand" ]]; then FILE="$cand"; break; fi
-  done < <(grep -Eo '[A-Za-z0-9._/-]+\.[A-Za-z0-9]+' "$BODY_FILE" | sort -u)
-fi
-
-# --- extract old/new snippets (first two backticked spans) ---
-OLD="$(perl -0777 -ne 'while(/`([^`]+)`/g){print "$1\n"}' "$BODY_FILE" | sed -n '1p' | tr -d "\r")"
-NEW="$(perl -0777 -ne 'while(/`([^`]+)`/g){print "$1\n"}' "$BODY_FILE" | sed -n '2p' | tr -d "\r")"
-
-# --- guardrails and helpful comments ---
-if [[ -z "${FILE:-}" ]]; then
-  gh issue comment "$ISSUE" -R "$REPO" -b "Agent: No file path found in the issue. Please add a line like:
-\`Path to file: relative/path/to/file.ext\`"
-  exit 0
-fi
-
-if [[ ! -f "$FILE" ]]; then
-  gh issue comment "$ISSUE" -R "$REPO" -b "Agent: File not found: \`$FILE\`. Please verify the path."
-  exit 0
-fi
-
-if [[ -z "${OLD:-}" || -z "${NEW:-}" ]]; then
-  gh issue comment "$ISSUE" -R "$REPO" -b "Agent: Could not find two backticked snippets in the issue body (old → new). Please provide:
-\`\`\`
-old code in \`backticks\`
-new code in \`backticks\`
-\`\`\`"
-  exit 0
-fi
-
-# --- apply single replacement (first occurrence) ---
-TMP="$(mktemp)"
-changed=0
-perl -0777 -pe '
-  BEGIN { $old=$ENV{"OLD"}; $new=$ENV{"NEW"}; $done=0 }
-  if (!$done && index($_,$old) >= 0) { s/\Q$old\E/$new/ and $done=1; }
-  END { if(!$done){ exit 2 } }
-' OLD="$OLD" NEW="$NEW" "$FILE" > "$TMP" || rc=$?
-
-if [[ ${rc:-0} -eq 2 ]]; then
-  rm -f "$TMP"
-  gh issue comment "$ISSUE" -R "$REPO" -b "Agent: The specified snippet was not found in \`$FILE\`. No changes made."
-  exit 0
-fi
-
-if ! cmp -s "$FILE" "$TMP"; then
-  mv "$TMP" "$FILE"
-  changed=1
+# --- run LLM edit once (LLM is the only mechanism; no fallbacks) ---
+if [[ ${#TARGET_FILES[@]} -gt 0 ]]; then
+  timeout -k 5 180 aider "${AIDER_ARGS[@]}" --message "$(cat /tmp/agent_prompt.txt)" "${TARGET_FILES[@]}" || true
 else
-  rm -f "$TMP"
+  timeout -k 5 180 aider "${AIDER_ARGS[@]}" --message "$(cat /tmp/agent_prompt.txt)" || true
 fi
 
-if [[ "$changed" -ne 1 ]]; then
-  gh issue comment "$ISSUE" -R "$REPO" -b "Agent: No modifications were necessary."
+# --- if nothing changed, post a comment and exit ---
+if git diff --quiet && git diff --cached --quiet; then
+  gh issue comment "$ISSUE" -R "$REPO" -b "Agent ran the LLM but produced no changes."
   exit 0
 fi
 
-# --- commit / push / PR ---
+# --- commit/push/PR (no tests/linters here) ---
 git add -A
-git commit -m "Agent patch for #${ISSUE}: ${TITLE}"
+git -c user.name="hushline-agent" -c user.email="agent@users.noreply.github.com" \
+  commit -m "Agent patch for #${ISSUE}: ${ISSUE_TITLE}"
+
 git push -u origin "$BR"
 
-PR_NUM="$(gh pr list -R "$REPO" --head "$BR" --json number -q '.[0].number')"
-if [[ -z "$PR_NUM" ]]; then
-  gh pr create -R "$REPO" -t "Agent patch for #${ISSUE}: ${TITLE}" -b "Automated patch for #${ISSUE}."
+EXISTING_PR="$(gh pr list -R "$REPO" --head "$BR" --json number -q '.[0].number')"
+if [[ -z "$EXISTING_PR" ]]; then
+  gh pr create -R "$REPO" \
+    -t "Agent patch for #${ISSUE}: ${ISSUE_TITLE}" \
+    -b "Automated patch for #${ISSUE}."
 else
-  gh pr comment -R "$REPO" "$PR_NUM" -b "Updated patch."
+  gh pr comment -R "$REPO" "$EXISTING_PR" -b "Agent updated the patch."
 fi
 
-gh issue comment "$ISSUE" -R "$REPO" -b "Agent created/updated PR from \`$BR\` targeting \`${DEFAULT_BRANCH}\`."
+gh issue comment "$ISSUE" -R "$REPO" -b "Agent created/updated PR from branch \`$BR\`."

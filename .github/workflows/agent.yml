@@ -1,24 +1,20 @@
 name: run-agent
 
 on:
-  issues:
-    types: [labeled]
   workflow_dispatch:
     inputs:
-      issue:
-        description: Issue number
+      issue_number:
+        description: "Issue number"
         required: true
-        type: string
+  issues:
+    types: [labeled]
 
 jobs:
   agent:
-    if: >
-      (github.event_name == 'issues' && github.event.label.name == 'agent') ||
-      (github.event_name == 'workflow_dispatch')
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issues' && contains(github.event.label.name, 'agent:run'))
     runs-on: self-hosted
-
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     steps:
       - name: Checkout
@@ -26,8 +22,23 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Resolve issue number
+        id: issue
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "NUM=${{ github.event.inputs.issue_number }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "NUM=${{ github.event.issue.number }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Warm up Ollama (best effort)
+        run: |
+          curl -fsS "${OLLAMA_API_BASE:-http://127.0.0.1:11434}/api/tags" || true
+
       - name: Run agent
         env:
-          ISSUE_NUM: ${{ github.event_name == 'workflow_dispatch' && inputs.issue || github.event.issue.number }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OLLAMA_API_BASE: ${{ vars.OLLAMA_API_BASE || 'http://127.0.0.1:11434' }}
+          AIDER_MODEL: ${{ vars.AIDER_MODEL || 'ollama_chat/qwen2.5-coder:7b-instruct' }}
         run: |
-          bash ops/agent.sh "$ISSUE_NUM"
+          bash ops/agent.sh "${{ steps.issue.outputs.NUM }}"
