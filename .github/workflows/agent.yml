@@ -1,26 +1,17 @@
 name: run-agent
 
 on:
-  # Manual run from the Actions tab
   workflow_dispatch:
     inputs:
       issue:
-        description: "Issue number to work on"
+        description: "Issue number"
         required: true
         type: string
-  # Optional: auto-run when a label is added to an issue
   issues:
     types: [labeled]
 
-env:
-  # Model & Ollama defaults (override in repo/Org secrets if needed)
-  OLLAMA_API_BASE: http://127.0.0.1:11434
-  OLLAMA_HOST: http://127.0.0.1:11434
-  AIDER_MODEL: ollama_chat/qwen2.5-coder:7b-instruct
-
 jobs:
   run:
-    # Use your self-hosted ARM64 runner
     runs-on: self-hosted
 
     steps:
@@ -30,45 +21,27 @@ jobs:
         run: |
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             echo "num=${{ inputs.issue }}" >> "$GITHUB_OUTPUT"
-          else
-            # issues:labeled path
+          elif [[ "${{ github.event_name }}" == "issues" && "${{ github.event.action }}" == "labeled" && "${{ github.event.label.name }}" == "agent" ]]; then
             echo "num=${{ github.event.issue.number }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "No issue number available."; exit 1
           fi
 
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # Make sure line endings are LF and script is executable
-      - name: Normalize agent.sh (LF) & chmod
+      - name: Ensure LF & executable
         shell: bash
         run: |
-          sed -i 's/\r$//' ops/agent.sh
+          sed -i 's/\r$//' ops/agent.sh || true
           chmod +x ops/agent.sh
 
-      # Optional: pre-pull model so Aider doesn’t block
-      - name: Warm up Ollama
-        shell: bash
-        env:
-          OLLAMA_API_BASE: ${{ env.OLLAMA_API_BASE }}
-          AIDER_MODEL: ${{ env.AIDER_MODEL }}
-        run: |
-          model="${AIDER_MODEL#*/}"          # strip "ollama_chat/" if present
-          model="${model#ollama/}"           # strip "ollama/" if present
-          model="${model:-qwen2.5-coder:7b-instruct}"
-          echo "Pulling model: $model"
-          curl -fsS -X POST "$OLLAMA_API_BASE/api/pull" \
-            -H 'Content-Type: application/json' \
-            -d "{\"model\":\"$model\"}" || true
-
-      # Run the agent (call via 'bash' to avoid CRLF shebang issues)
       - name: Run agent
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          OLLAMA_API_BASE: ${{ env.OLLAMA_API_BASE }}
-          OLLAMA_HOST: ${{ env.OLLAMA_HOST }}
-          AIDER_MODEL: ${{ env.AIDER_MODEL }}
+          OLLAMA_API_BASE: http://127.0.0.1:11434
+          AIDER_MODEL: ollama:qwen2.5-coder:7b-instruct
         run: |
           bash ops/agent.sh "${{ steps.issue.outputs.num }}"
