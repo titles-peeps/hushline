@@ -9,7 +9,7 @@ if [[ $# -ne 1 ]]; then
 fi
 
 ISSUE="$1"
-REPO="${REPO:-scidsg/hushline}"
+REPO="${REPO:-titles-peeps/hushline}"
 
 : "${GH_TOKEN:?GH_TOKEN must be set in env}"
 export GITHUB_TOKEN="$GH_TOKEN"
