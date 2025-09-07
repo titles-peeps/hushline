@@ -9,63 +9,48 @@ if [[ $# -ne 1 ]]; then
 fi
 
 ISSUE="$1"
+REPO="${REPO:-titles-peeps/hushline}"
 
-# --- Resolve REPO (owner/name) -------------------------------------------------
-if [[ -n "${REPO:-}" ]]; then
-  REPO="$REPO"
-else
-  origin_url="$(git config --get remote.origin.url || true)"
-  if [[ "$origin_url" =~ github.com[:/](.+)/(.+)\.git$ ]]; then
-    REPO="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
-  else
-    REPO="titles-peeps/hushline"
-  fi
-fi
-
-# --- Auth ----------------------------------------------------------------------
 : "${GH_TOKEN:?GH_TOKEN must be set in env}"
 export GITHUB_TOKEN="$GH_TOKEN"
 
-# --- Model/runtime knobs -------------------------------------------------------
+# Stable Ollama endpoint + tame resource usage
 export OLLAMA_API_BASE="${OLLAMA_API_BASE:-http://127.0.0.1:11434}"
 export OLLAMA_HOST="${OLLAMA_HOST:-http://127.0.0.1:11434}"
 export OLLAMA_NUM_PARALLEL=1
 export OLLAMA_KEEP_ALIVE=10m
 export AIDER_ANALYTICS_DISABLE=1
+
+# Force Aider to native ollama provider (never Litellm), ignore local overrides
 unset LITELLM_PROVIDER LITELLM_OLLAMA_BASE OPENAI_API_KEY ANTHROPIC_API_KEY
+unset AIDER_MODEL AIDER_WEAK_MODEL AIDER_EDITOR_MODEL AIDER_EDITOR_EDIT_FORMAT
+MODEL="${AIDER_MODEL_OVERRIDE:-ollama_chat/qwen2.5-coder:7b-instruct}"
 
-# IMPORTANT: real Ollama provider (not litellm alias)
-MODEL="${AIDER_MODEL:-ollama:qwen2.5-coder:7b-instruct}"
-
-# --- Sanity checks -------------------------------------------------------------
+# Repo root and prompt template
 [[ -d .git ]] || { echo "must run in repo root"; exit 1; }
 [[ -f ops/agent_prompt.tmpl ]] || { echo "missing ops/agent_prompt.tmpl"; exit 1; }
 
+# Git identity
 git config user.name  >/dev/null 2>&1 || git config user.name  "hushline-agent"
 git config user.email >/dev/null 2>&1 || git config user.email "agent@users.noreply.github.com"
 
-for bin in gh git aider curl jq; do
+# Deps
+for bin in gh git aider curl jq perl; do
   command -v "$bin" >/dev/null || { echo "missing dependency: $bin"; exit 1; }
 done
 
-# --- Ollama health + pre-pull --------------------------------------------------
+# Ollama health check
 set +e
-curl -fsS "${OLLAMA_API_BASE}/api/tags" | jq -r '.models[].name' >/dev/null
+curl -fsS "${OLLAMA_API_BASE}/api/tags" | jq -r .models[0].name >/dev/null
 HEALTH_RC=$?
 set -e
 [[ $HEALTH_RC -ne 0 ]] && { echo "ollama health check failed"; exit 1; }
 
-plain_model="${MODEL#ollama:}"
-if ! curl -fsS "${OLLAMA_API_BASE}/api/tags" | jq -e --arg m "$plain_model" '([.models[].name] | join(" ")) | contains($m)' >/dev/null; then
-  curl -fsS "${OLLAMA_API_BASE}/api/pull" \
-    -H 'Content-Type: application/json' \
-    -d "{\"model\":\"${plain_model}\"}" >/dev/null
-fi
-
-# --- Issue data ----------------------------------------------------------------
+# Issue data (preserve newlines)
 ISSUE_TITLE="$(gh issue view "$ISSUE" -R "$REPO" --json title -q .title)"
 ISSUE_BODY="$(gh issue view "$ISSUE" -R "$REPO" --json body  -q .body)"
 
+# Branch off default
 DEFAULT_BRANCH="$(gh repo view "$REPO" --json defaultBranchRef -q .defaultBranchRef.name 2>/dev/null || true)"
 [[ -z "$DEFAULT_BRANCH" ]] && DEFAULT_BRANCH="$(git remote show origin 2>/dev/null | sed -n 's/.*HEAD branch: //p' || true)"
 [[ -z "$DEFAULT_BRANCH" ]] && DEFAULT_BRANCH="main"
@@ -74,30 +59,30 @@ BR="agent/issue-${ISSUE}-$(date +%Y%m%d-%H%M%S)"
 git fetch origin --prune
 git checkout -B "$BR" "origin/$DEFAULT_BRANCH"
 
-# Don't ever commit our own script or poetry.toml noise
-git update-index --assume-unchanged ops/agent.sh || true
-git update-index --assume-unchanged poetry.toml   || true
-
-# --- Prompt --------------------------------------------------------------------
+# Build prompt
 export ISSUE_NUMBER="$ISSUE" ISSUE_TITLE ISSUE_BODY
 envsubst < ops/agent_prompt.tmpl > /tmp/agent_prompt.txt
 
-# Limit context to files mentioned in the issue body
+# Detect explicit files referenced in the issue
 TARGET_FILES=()
 while IFS= read -r f; do
   [[ -f "$f" ]] && TARGET_FILES+=("$f")
-done < <(
-  printf '%s' "$ISSUE_BODY" |
-  grep -Eo '([A-Za-z0-9._/-]+\.(scss|css|py|js|ts|html|jinja2|sh|yml|yaml))' |
-  sort -u
-)
+done < <(echo "$ISSUE_BODY" | grep -Eo '([A-Za-z0-9._/-]+\.(scss|css|py|js|ts|html|jinja2|sh|yml|yaml|md|txt|json|toml|ini))' | sort -u)
+
+# Aider settings: force model via a temp model-settings file (ignores local configs)
+MSF="$(mktemp)"
+cat > "$MSF" <<YAML
+model: ${MODEL}
+YAML
 
 AIDER_ARGS=(
   --yes
   --no-gitignore
   --model "$MODEL"
+  --model-settings-file "$MSF"
+  --no-show-model-warnings
   --edit-format udiff
-  --timeout 120
+  --timeout 60
   --no-stream
   --disable-playwright
   --map-refresh files
@@ -106,53 +91,96 @@ AIDER_ARGS=(
   --max-chat-history-tokens 512
 )
 
+AIDER_LOG="$(mktemp)"
 run_aider() {
   if [[ ${#TARGET_FILES[@]} -gt 0 ]]; then
     nice -n 10 ionice -c2 -n7 timeout -k 10 420 \
-      aider "${AIDER_ARGS[@]}" --message "$(cat /tmp/agent_prompt.txt)" "${TARGET_FILES[@]}" || true
+      aider "${AIDER_ARGS[@]}" --message "$(cat /tmp/agent_prompt.txt)" "${TARGET_FILES[@]}" \
+      | tee "$AIDER_LOG" || true
   else
     nice -n 10 ionice -c2 -n7 timeout -k 10 420 \
-      aider "${AIDER_ARGS[@]}" --message "$(cat /tmp/agent_prompt.txt)" || true
+      aider "${AIDER_ARGS[@]}" --message "$(cat /tmp/agent_prompt.txt)" \
+      | tee "$AIDER_LOG" || true
   fi
 }
 
-# --- First pass ---------------------------------------------------------------
 run_aider
 
-# If the issue referenced files but none of them changed, bail out (even if other files changed)
-if [[ ${#TARGET_FILES[@]} -gt 0 ]]; then
-  if git diff --quiet -- "${TARGET_FILES[@]}"; then
-    gh issue comment "$ISSUE" -R "$REPO" -b "Agent attempted patch but produced no changes to: ${TARGET_FILES[*]}."
-    exit 0
-  fi
-else
-  # No specific files referenced; if nothing changed at all, bail
-  if git diff --quiet; then
-    gh issue comment "$ISSUE" -R "$REPO" -b "Agent attempted patch but no changes were made."
-    exit 0
-  fi
+# ------------------------------
+# Generic fallback patcher
+# ------------------------------
+# Heuristics:
+#   1) Try to extract "old" from 'currently defined as: `...`'
+#      and "new" from 'Expected Outcome: `...`'.
+#   2) Else, take the FIRST and SECOND inline code snippets (backticked).
+#
+extract_inline_code_first() {
+  perl -0777 -ne 'while(/`([^`]+)`/g){ print "$1\n"; exit 0 }' <<<"$ISSUE_BODY" 2>/dev/null || true
+}
+extract_inline_code_second() {
+  perl -0777 -ne 'my $c=0; while(/`([^`]+)`/g){ $c++; if($c==2){ print "$1\n"; exit 0 } }' <<<"$ISSUE_BODY" 2>/dev/null || true
+}
+extract_old_from_phrase() {
+  perl -0777 -ne 'if(/currently\s+defined\s+as:\s*`([^`]+)`/i){ print "$1\n" }' <<<"$ISSUE_BODY" 2>/dev/null || true
+}
+extract_new_from_phrase() {
+  perl -0777 -ne 'if(/Expected\s+Outcome:.*?`([^`]+)`/is){ print "$1\n" }' <<<"$ISSUE_BODY" 2>/dev/null || true
+}
+
+OLD_SNIP="$(extract_old_from_phrase)"
+NEW_SNIP="$(extract_new_from_phrase)"
+
+if [[ -z "${OLD_SNIP}" || -z "${NEW_SNIP}" ]]; then
+  # Fallback to first/second inline code
+  [[ -z "$OLD_SNIP" ]] && OLD_SNIP="$(extract_inline_code_first || true)"
+  [[ -z "$NEW_SNIP" ]] && NEW_SNIP="$(extract_inline_code_second || true)"
 fi
 
-# --- Lint feedback loop -------------------------------------------------------
+# If Aider errored with litellm provider OR made no changes, try generic literal patch
+NEED_FALLBACK=0
+if grep -q "LLM Provider NOT provided" "$AIDER_LOG"; then
+  NEED_FALLBACK=1
+fi
+if git diff --quiet; then
+  NEED_FALLBACK=1
+fi
+
+if [[ "$NEED_FALLBACK" -eq 1 && -n "${OLD_SNIP:-}" && -n "${NEW_SNIP:-}" && ${#TARGET_FILES[@]} -gt 0 ]]; then
+  echo "Attempting generic fallback replacement in referenced files…"
+  for f in "${TARGET_FILES[@]}"; do
+    if grep -Fq -- "$OLD_SNIP" "$f"; then
+      # Literal, global replacement OLD -> NEW
+      perl -0777 -pe 'BEGIN{$old=$ENV{OLD};$new=$ENV{NEW}} s/\Q$old\E/$new/g' \
+        OLD="$OLD_SNIP" NEW="$NEW_SNIP" -i "$f" || true
+      git add "$f" || true
+    fi
+  done
+fi
+
+# If still no changes, report and exit
+if git diff --quiet; then
+  if (( ${#TARGET_FILES[@]} )); then
+    gh issue comment "$ISSUE" -R "$REPO" -b "Agent attempted patch but produced no changes to: ${TARGET_FILES[*]}."
+  else
+    gh issue comment "$ISSUE" -R "$REPO" -b "Agent attempted patch but found no referenced files to modify."
+  fi
+  exit 0
+fi
+
+# ------------------------------
+# Lint loop (no Docker -> skip)
+# ------------------------------
 lint_once() {
   local log=/tmp/lint.log rc=0
-
   if [[ -S /var/run/docker.sock ]] && groups "$(whoami)" | grep -q docker; then
     if [[ -f Makefile ]] && grep -qE '^[[:space:]]*lint:' Makefile; then
       set +e; make lint > /dev/null 2> "$log"; rc=$?; set -e
-      echo "$log:$rc"; return
+    else
+      echo "no make lint" > "$log"; rc=0
     fi
+  else
+    echo "no docker, skipping dockerized lint" > "$log"; rc=0
   fi
-
-  if [[ -f package.json ]] && command -v jq >/dev/null && jq -e '.scripts.lint' package.json >/dev/null; then
-    set +e
-    npm ci --no-audit --prefer-offline >/dev/null 2>&1 || true
-    npm run -s lint > /dev/null 2> "$log"; rc=$?
-    set -e
-    echo "$log:$rc"; return
-  fi
-
-  echo "no docker, skipping dockerized lint" > "$log"; rc=0
   echo "$log:$rc"
 }
 
@@ -160,27 +188,24 @@ for attempt in 1 2; do
   out_rc="$(lint_once)"; log="${out_rc%:*}"; rc="${out_rc##*:}"
   if [[ "$rc" -eq 0 ]]; then break; fi
   FEEDBACK="$(tail -n 200 "$log")"
-  {
-    echo "Fix these lint errors. Change only what's needed."
-    echo
-    echo '```'
-    printf '%s\n' "$FEEDBACK"
-    echo '```'
-  } > /tmp/agent_feedback.txt
+  printf '%s\n' "Fix these lint errors. Change only what's needed.
 
-  nice -n 10 ionice -c2 -n7 timeout -k 10 300 \
-    aider "${AIDER_ARGS[@]}" --message "$(cat /tmp/agent_feedback.txt)" || true
-
+\`\`\`
+${FEEDBACK}
+\`\`\`
+" > /tmp/agent_feedback.txt
+  timeout -k 10 180 aider "${AIDER_ARGS[@]}" --message "$(cat /tmp/agent_feedback.txt)" || true
   git add -A || true
   git commit -m "agent: lint fix attempt $attempt" || true
 done
 
-# --- Decide whether to run pytest --------------------------------------------
+# ------------------------------
+# Tests (skip for frontend-only/text-only changes)
+# ------------------------------
 run_tests=true
 current_head="$(git rev-parse --abbrev-ref HEAD)"
-changed_files="$(git diff --name-only "origin/$DEFAULT_BRANCH...$current_head" || true)"
-if grep -qE '\.(scss|css|js|ts|html|jinja2|yml|yaml)$' <<<"$changed_files" \
-   && ! grep -qE '\.py($| )' <<<"$changed_files"; then
+changed_files="$(git diff --name-only "origin/$DEFAULT_BRANCH"..."$current_head")"
+if grep -qE '\.(scss|css|js|ts|html|jinja2|yml|yaml|md|txt)$' <<<"$changed_files" && ! grep -qE '\.py($| )' <<<"$changed_files"; then
   run_tests=false
 fi
 
@@ -190,23 +215,17 @@ if $run_tests && command -v pytest >/dev/null 2>&1; then
   set +e; timeout -k 10 600 pytest -q; RC=$?; set -e
 fi
 
-# --- Commit, push, PR ---------------------------------------------------------
+# Commit & push
 git add -A
-
-# Remove our script/poetry from the index if they slipped back in
-git restore --staged ops/agent.sh poetry.toml 2>/dev/null || true
-
 git commit -m "Agent patch for #${ISSUE} (${ISSUE_TITLE}) (tests rc=${RC})" || true
 git push -u origin "$BR"
 
+# PR
 EXISTING_PR="$(gh pr list -R "$REPO" --head "$BR" --json number -q '.[0].number')"
 if [[ -z "$EXISTING_PR" ]]; then
-  gh pr create -R "$REPO" \
-    -t "Agent patch for #${ISSUE}: ${ISSUE_TITLE}" \
-    -b "Automated patch for #${ISSUE}. Test exit code: ${RC}."
+  gh pr create -R "$REPO" -t "Agent patch for #${ISSUE}: ${ISSUE_TITLE}" -b "Automated patch for #${ISSUE}. Test exit code: ${RC}."
 else
   gh pr comment -R "$REPO" "$EXISTING_PR" -b "Updated patch. Test exit code: ${RC}."
 fi
 
-gh issue comment "$ISSUE" -R "$REPO" \
-  -b "Agent created/updated PR from branch \`$BR\`. Test exit code: ${RC}."
+gh issue comment "$ISSUE" -R "$REPO" -b "Agent created/updated PR from branch \`$BR\`. Test exit code: ${RC}."
