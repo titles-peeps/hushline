@@ -1,51 +1,99 @@
 name: hushline-agent
+
 on:
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: "Issue number to work on"
+        required: true
   issues:
     types: [labeled]
 
+permissions:
+  contents: write        # push branches
+  pull-requests: write   # open/comment PRs
+  issues: write          # comment on issues
+
+concurrency:
+  group: agent-${{ github.ref || format('issue-{0}', github.event.issue.number) }}
+  cancel-in-progress: false
+
 jobs:
   run:
-    if: contains(github.event.label.name, 'agent')
-    runs-on: [self-hosted, agent]
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issues' && github.event.action == 'labeled' && github.event.label.name == 'agent')
+    runs-on: self-hosted
+
+    timeout-minutes: 30
+
+    env:
+      # App env
+      DATABASE_URL: sqlite:///./test.db
+      FLASK_ENV: test
+      # Auth for gh CLI used by ops/agent.sh
+      GH_TOKEN: ${{ secrets.GH_TOKEN }}
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Install Poetry (user) + pin Python 3.11
+      - name: Figure out issue number
+        id: pick
+        shell: bash
         run: |
-          python3.11 -m pip install --user --upgrade pip poetry
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "issue=${{ inputs.issue }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "issue=${{ github.event.issue.number }}" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Force Poetry venv in-project (.venv) with Python 3.11
+      - name: Quick tool sanity
+        shell: bash
         run: |
-          poetry config virtualenvs.create true --local
-          poetry config virtualenvs.in-project true --local
-          poetry env use /usr/bin/python3.11
-          poetry run python -V
-          echo "VENV=$(poetry env info -p)" >> "$GITHUB_ENV"
-          echo "$VENV/bin" >> "$GITHUB_PATH"
+          set -euo pipefail
+          echo "::group::versions"
+          command -v git && git --version
+          command -v gh && gh --version
+          command -v bash && bash --version | head -n1
+          command -v curl && curl --version | head -n1
+          command -v jq && jq --version
+          echo "::endgroup::"
+          # Ensure the script is executable
+          chmod +x ops/agent.sh
 
-      - name: Install project deps into the venv
+      - name: Ollama health check (non-fatal)
+        shell: bash
+        continue-on-error: true
         run: |
-          poetry install -n
-          poetry run pip install -U pytest aider-chat
+          set -euo pipefail
+          : "${OLLAMA_API_BASE:=http://127.0.0.1:11434}"
+          echo "Using OLLAMA_API_BASE=$OLLAMA_API_BASE"
+          curl -sSf "$OLLAMA_API_BASE/api/tags" | jq '.models | length'
 
-      - name: Configure Git identity
+      - name: Run agent (debug)
+        shell: bash
         run: |
-          git config user.name "hushline-agent"
-          git config user.email "agent@users.noreply.github.com"
-
-      - name: Ensure agent script is executable
-        run: chmod +x ops/agent.sh
-
-      - name: Test DB override (SQLite)
-        run: |
-          echo 'DATABASE_URL=sqlite:///./test.db' >> $GITHUB_ENV
-          echo 'FLASK_ENV=test' >> $GITHUB_ENV
-
-      - name: Run agent
+          set -euo pipefail
+          echo "DATABASE_URL=${DATABASE_URL}" >> "$GITHUB_ENV"
+          echo "::group::agent-run"
+          bash -x ./ops/agent.sh "${{ steps.pick.outputs.issue }}" 2>&1 | tee agent.log
+          echo "::endgroup::"
         env:
-          GH_TOKEN: ${{ secrets.AGENT_TOKEN }}
-          PYTHON: ${{ env.VENV }}/bin/python
-        run: ./ops/agent.sh "${{ github.event.issue.number }}"
+          # Optional hints for your script; harmless if unused
+          OLLAMA_API_BASE: ${{ env.OLLAMA_API_BASE }}
+          OLLAMA_HOST: ${{ env.OLLAMA_API_BASE }}
+
+      - name: Upload agent artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-artifacts-${{ steps.pick.outputs.issue }}
+          path: |
+            agent.log
+            .aider.chat.history.md
+            .aider.input.history
+          if-no-files-found: ignore
