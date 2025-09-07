@@ -1,90 +1,50 @@
 name: run-agent
 
 on:
-  workflow_dispatch:
-    inputs:
-      issue:
-        description: "Issue number to work on"
-        required: false
   issues:
     types: [labeled]
 
-permissions:
-  contents: write
-  pull-requests: write
-  issues: write
-
-env:
-  GH_TOKEN: ${{ secrets.AGENT_TOKEN }}
-  OLLAMA_API_BASE: http://127.0.0.1:11434
-  AIDER_MODEL: ollama:qwen2.5-coder:7b-instruct
-
 jobs:
-  agent:
-    if: >
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'issues' &&
-       contains(github.event.label.name, 'agent'))
+  run:
+    if: contains(github.event.label.name, 'run-agent')
     runs-on: self-hosted
+
+    env:
+      GH_TOKEN: ${{ secrets.AGENT_TOKEN }}
+      # Talk directly to local Ollama:
+      OLLAMA_API_BASE: http://127.0.0.1:11434
+      # IMPORTANT: use the SLASH form so Aider uses native Ollama client
+      AIDER_MODEL: ollama_chat/qwen2.5-coder:7b-instruct
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Resolve issue number
-        id: resolve
+      - name: Show runner basics
+        run: |
+          echo "Runner: $(uname -a)"
+          echo "Python: $(python3 -V || true)"
+          echo "Ollama API: ${OLLAMA_API_BASE}"
+
+      - name: Warm up Ollama (pull model if missing)
         shell: bash
         run: |
           set -euo pipefail
-          if [[ -n "${{ github.event.inputs.issue }}" ]]; then
-            echo "ISSUE_NUM=${{ github.event.inputs.issue }}" >> "$GITHUB_ENV"
-          elif [[ "${{ github.event_name }}" == "issues" ]]; then
-            echo "ISSUE_NUM=${{ github.event.issue.number }}" >> "$GITHUB_ENV"
-          else
-            echo "No issue number provided"; exit 1
+          curl -fsS "$OLLAMA_API_BASE/api/tags" | jq -r '.models[].name' || true
+          if ! curl -fsS "$OLLAMA_API_BASE/api/tags" \
+             | jq -e --arg m "$(echo '${{ env.AIDER_MODEL }}' | sed 's#.*[/]\(.*\)#\1#')" \
+                  '.models[].name | contains($m)' >/dev/null; then
+            plain="$(echo '${{ env.AIDER_MODEL }}' | sed 's#.*[/]\(.*\)#\1#')"
+            echo "Pulling model: $plain"
+            curl -fsS "$OLLAMA_API_BASE/api/pull" \
+              -H 'Content-Type: application/json' \
+              -d "{\"model\":\"$plain\"}"
           fi
 
-      - name: Warm up Ollama (best effort)
-        continue-on-error: true
+      - name: Run agent
         shell: bash
+        env:
+          ISSUE_NUM: ${{ github.event.issue.number }}
         run: |
           set -euo pipefail
-          curl -fsS "$OLLAMA_API_BASE/api/tags" || true
-          curl -fsS "$OLLAMA_API_BASE/api/pull" \
-            -H 'Content-Type: application/json' \
-            -d "{\"model\":\"${AIDER_MODEL#ollama:}\"}" || true
-
-      - name: Run agent (capped)
-        if: env.ISSUE_NUM
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          # Soft resource caps to keep the box stable
-          export OMP_NUM_THREADS=2
-          export MKL_NUM_THREADS=1
-          export NUMEXPR_MAX_THREADS=2
-          export OLLAMA_NUM_PARALLEL=1
-          export OLLAMA_KEEP_ALIVE=5m
-
-          # Use systemd-run --user only if a user session bus/runtime exists
-          have_user_session=0
-          if command -v systemd-run >/dev/null 2>&1 && command -v systemctl >/dev/null 2>&1; then
-            if [[ -n "${XDG_RUNTIME_DIR:-}" ]] && systemctl --user is-system-running >/dev/null 2>&1; then
-              have_user_session=1
-            fi
-          fi
-
-          if [[ "$have_user_session" -eq 1 ]]; then
-            # user scope available → run with a memory cap
-            systemd-run --user --scope -p MemoryMax=4G -p CPUQuota=150% \
-              bash ops/agent.sh "$ISSUE_NUM"
-          else
-            # fallback: no user systemd session on this runner
-            ulimit -v $((4*1024*1024)) || true   # 4G address space
-            ulimit -m $((4*1024*1024)) || true   # 4G resident (best-effort)
-            taskset -c 0-3 ionice -c2 -n7 nice -n 10 \
-              bash ops/agent.sh "$ISSUE_NUM"
-          fi
+          bash ops/agent.sh "$ISSUE_NUM"

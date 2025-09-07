@@ -5,23 +5,33 @@ set -euo pipefail
 : "${GH_TOKEN:?GH_TOKEN is required}"
 export GITHUB_TOKEN="$GH_TOKEN"
 
-# Ensure Aider talks directly to your local Ollama server.
+# --- force native Ollama (never LiteLLM) ---
 unset LITELLM_PROVIDER LITELLM_OLLAMA_BASE OPENAI_API_KEY ANTHROPIC_API_KEY
 export OLLAMA_API_BASE="${OLLAMA_API_BASE:-http://127.0.0.1:11434}"
-export OLLAMA_HOST="${OLLAMA_HOST:-http://127.0.0.1:11434}"
+export OLLAMA_HOST="${OLLAMA_HOST:-$OLLAMA_API_BASE}"
+
+# Model: accept env, but rewrite colon form to slash form defensively
 MODEL="${AIDER_MODEL:-ollama_chat/qwen2.5-coder:7b-instruct}"
+MODEL="${MODEL/ollama:/ollama_chat/}"
 
-# Detect repo from git remote; fallback as requested
-REPO="${REPO:-$(git remote get-url origin 2>/dev/null | sed -n 's#.*github.com[:/]\(.*\.git\)#\1#p' | sed 's/\.git$//')}"
-REPO="${REPO:-titles-peeps/hushline}"
-
-MODEL="${AIDER_MODEL:-ollama:qwen2.5-coder:7b-instruct}"
+# Args
 ISSUE_NUM="${1:?usage: ops/agent.sh <issue_number>}"
 
+# Detect repo from git remote; fallback to titles-peeps/hushline
+REPO="${REPO:-$(git remote get-url origin 2>/dev/null \
+       | sed -n 's#.*github.com[:/]\(.*\.git\)#\1#p' \
+       | sed 's/\.git$//')}"
+REPO="${REPO:-titles-peeps/hushline}"
+
 # Ensure tools
-for b in gh git aider; do
+for b in gh git aider curl jq; do
   command -v "$b" >/dev/null || { echo "missing: $b"; exit 1; }
 done
+
+# Quick Ollama health
+if ! curl -fsS "$OLLAMA_API_BASE/api/tags" >/dev/null; then
+  echo "Ollama not reachable at $OLLAMA_API_BASE"; exit 1
+fi
 
 # Fetch issue data (preserve newlines)
 ISSUE_TITLE="$(gh issue view "$ISSUE_NUM" -R "$REPO" --json title -q .title)"
@@ -53,8 +63,11 @@ Context:
 ${ISSUE_BODY}
 EOF
 
-# Try to hint Aider with any file paths mentioned in the body (generic, no CSS special-casing)
-mapfile -t TARGET_FILES < <(printf '%s\n' "$ISSUE_BODY" | grep -Eo '([A-Za-z0-9._/-]+\.(py|js|ts|tsx|jsx|css|scss|html|jinja2|yml|yaml|sh))' | sort -u | while read -r f; do [[ -f "$f" ]] && echo "$f"; done)
+# Hint Aider with any paths mentioned (generic; no language special-casing)
+mapfile -t TARGET_FILES < <(printf '%s\n' "$ISSUE_BODY" \
+  | grep -Eo '([A-Za-z0-9._/-]+\.[A-Za-z0-9]+)' \
+  | sort -u \
+  | while read -r f; do [[ -f "$f" ]] && echo "$f"; done)
 
 AIDER_ARGS=(
   --yes
@@ -67,6 +80,7 @@ AIDER_ARGS=(
   --map-multiplier-no-files 0
   --map-tokens 256
   --max-chat-history-tokens 768
+  --no-show-model-warnings
 )
 
 # Run aider (single pass)
@@ -76,7 +90,7 @@ else
   aider "${AIDER_ARGS[@]}" --message "$(cat /tmp/agent_prompt.txt)" || true
 fi
 
-# If nothing changed, just note it and exit cleanly (keeps the system stable)
+# If nothing changed, just note it and exit cleanly
 if git diff --quiet && git diff --cached --quiet; then
   gh issue comment "$ISSUE_NUM" -R "$REPO" -b "Agent attempted patch but produced no changes."
   exit 0
