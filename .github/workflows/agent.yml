@@ -1,80 +1,52 @@
 name: run-agent
 
 on:
-  # Run when an issue is labeled "agent:run"
-  issues:
-    types: [labeled]
-  # Or manually from the Actions tab
+  # Manual trigger
   workflow_dispatch:
     inputs:
-      issue_num:
+      issue:
         description: Issue number to work on
         required: true
-        default: "1"
+  # Auto-trigger when an issue is labeled "agent"
+  issues:
+    types: [labeled]
 
 jobs:
   agent:
+    # Don’t skip: allow manual OR labeled issues with label "agent"
     if: >
       github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'issues' && github.event.label.name == 'agent:run')
+      (github.event_name == 'issues' &&
+       github.event.action == 'labeled' &&
+       github.event.label.name == 'agent')
+
     runs-on: self-hosted
-
-    env:
-      # === REQUIRED: do not rename these ===
-      GH_TOKEN: ${{ secrets.AGENT_TOKEN }}
-      OLLAMA_API_BASE: http://127.0.0.1:11434
-      # Force Aider's *native* Ollama adapter (not LiteLLM)
-      AIDER_MODEL: ollama_chat/qwen2.5-coder:7b-instruct
-
-      # Make it very hard for LiteLLM to get invoked accidentally
-      LITELLM_PROVIDER: ""
-      LITELLM_OLLAMA_BASE: ""
-      OPENAI_API_KEY: ""
-      ANTHROPIC_API_KEY: ""
-      MISTRAL_API_KEY: ""
-      TOGETHER_API_KEY: ""
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Show git remote
-        run: git remote -v
-
-      - name: Sanitize local Aider config (prevent model override)
-        run: |
-          rm -f .aider.conf.yml .aider.model.settings.yml .aider* || true
-          echo "Sanitized .aider* configs if present."
-
-      - name: Verify tools
-        run: |
-          which aider || { echo "aider not found in PATH"; exit 1; }
-          which gh || { echo "gh not found in PATH"; exit 1; }
-          which git || { echo "git not found in PATH"; exit 1; }
-
-      - name: Warm up Ollama (non-fatal)
-        continue-on-error: true
-        run: |
-          curl -fsS "$OLLAMA_API_BASE/api/tags" | head -c 200 || true
-
-      - name: Pick issue number
-        id: pick
+      - name: Resolve issue number
+        id: resolve
         shell: bash
         run: |
+          set -euo pipefail
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "ISSUE_NUM=${{ inputs.issue_num }}" >> $GITHUB_OUTPUT
+            echo "ISSUE_NUM=${{ github.event.inputs.issue }}" >> "$GITHUB_ENV"
           else
-            echo "ISSUE_NUM=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
+            echo "ISSUE_NUM=${{ github.event.issue.number }}" >> "$GITHUB_ENV"
           fi
-          echo "Will run on issue: $(cat $GITHUB_OUTPUT)"
+          echo "Will work on issue #${ISSUE_NUM:-<unset>}"
 
       - name: Run agent
         shell: bash
         env:
-          ISSUE_NUM: ${{ steps.pick.outputs.ISSUE_NUM }}
+          # keep the original token name you’re using
+          GH_TOKEN: ${{ secrets.AGENT_TOKEN }}
+          # native Ollama endpoint on the runner
+          OLLAMA_API_BASE: http://127.0.0.1:11434
+          # use the native Aider Ollama adapter name (avoids LiteLLM provider error)
+          AIDER_MODEL: ollama_chat/qwen2.5-coder:7b-instruct
         run: |
           set -euo pipefail
-          echo "Running for issue #$ISSUE_NUM"
           bash ops/agent.sh "$ISSUE_NUM"
