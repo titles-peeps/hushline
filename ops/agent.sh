@@ -35,7 +35,6 @@ while IFS= read -r line || [[ -n "$line" ]]; do
 done < ops/agent_prompt.yml
 
 # Substitute placeholders in user template with actual issue data
-# (Ensure literal '$' in USER_TEMPLATE is preserved for substitution)
 ph_title="\$ISSUE_TITLE"
 ph_body="\$ISSUE_BODY"
 USER_PROMPT="${USER_TEMPLATE//$ph_title/$ISSUE_TITLE}"
@@ -65,7 +64,8 @@ echo "✅ Patch applied to the working directory."
 
 # 5. Format code (Python black and isort for imports)
 echo "Formatting code with black and isort..."
-pip install --no-cache-dir black isort >/dev/null 2>&1
+export PATH="$HOME/.local/bin:$PATH"
+python3 -m pip install --user --no-cache-dir black isort >/dev/null 2>&1 || true
 isort . && black .
 
 # 6. Commit and push changes to a new branch on the fork
