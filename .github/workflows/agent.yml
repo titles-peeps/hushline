@@ -1,11 +1,11 @@
-name: agent
+name: run-agent
 
 on:
   workflow_dispatch:
     inputs:
       issue:
         description: "Issue number to work on"
-        required: true
+        required: false
   issues:
     types: [labeled]
 
@@ -14,27 +14,64 @@ permissions:
   pull-requests: write
   issues: write
 
+env:
+  # ← keep your original tokens/names
+  GH_TOKEN: ${{ secrets.AGENT_TOKEN }}
+  OLLAMA_API_BASE: http://127.0.0.1:11434
+  AIDER_MODEL: ollama:qwen2.5-coder:7b-instruct
+  LITELLM_PROVIDER: ollama
+
 jobs:
-  run-agent:
+  agent:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issues' &&
+       contains(github.event.label.name, 'agent'))
     runs-on: self-hosted
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Resolve issue number
-        id: iss
+        id: resolve
         run: |
           if [[ -n "${{ github.event.inputs.issue }}" ]]; then
-            echo "num=${{ github.event.inputs.issue }}" >> "$GITHUB_OUTPUT"
+            echo "ISSUE_NUM=${{ github.event.inputs.issue }}" >> "$GITHUB_ENV"
+          elif [[ "${{ github.event_name }}" == "issues" ]]; then
+            echo "ISSUE_NUM=${{ github.event.issue.number }}" >> "$GITHUB_ENV"
           else
-            echo "num=${{ github.event.issue.number }}" >> "$GITHUB_OUTPUT"
+            echo "No issue number provided"; exit 1
           fi
 
-      - name: Run agent
-        env:
-          GH_TOKEN: ${{ secrets.AGENT_TOKEN }}
-          OLLAMA_API_BASE: http://127.0.0.1:11434
-          AIDER_MODEL: ollama_chat/qwen2.5-coder:7b-instruct
+      - name: Warm up Ollama (best effort)
+        continue-on-error: true
         run: |
-          bash ops/agent.sh "${{ steps.iss.outputs.num }}"
+          set -euo pipefail
+          curl -fsS "$OLLAMA_API_BASE/api/tags" || true
+          # pull model quietly; no failure if already present
+          curl -fsS "$OLLAMA_API_BASE/api/pull" \
+            -H 'Content-Type: application/json' \
+            -d "{\"model\":\"${AIDER_MODEL#ollama:}\"}" || true
+
+      - name: Run agent (capped)
+        if: env.ISSUE_NUM
+        shell: bash
+        run: |
+          set -euo pipefail
+          export OMP_NUM_THREADS=2
+          export MKL_NUM_THREADS=1
+          export NUMEXPR_MAX_THREADS=2
+          export OLLAMA_NUM_PARALLEL=1
+          export OLLAMA_KEEP_ALIVE=5m
+
+          if command -v systemd-run >/dev/null; then
+            systemd-run --user --scope -p MemoryMax=4G -p CPUQuota=150% \
+              bash ops/agent.sh "$ISSUE_NUM"
+          else
+            ulimit -v $((4*1024*1024)) || true
+            ulimit -m $((4*1024*1024)) || true
+            taskset -c 0-3 ionice -c2 -n7 nice -n 10 bash ops/agent.sh "$ISSUE_NUM"
+          fi

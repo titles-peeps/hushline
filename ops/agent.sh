@@ -1,80 +1,55 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# usage: ops/agent.sh <issue_number>
-if [[ $# -ne 1 ]]; then
-  echo "usage: ops/agent.sh <issue_number>" >&2
-  exit 2
-fi
-
+# --- required env (names unchanged) ---
 : "${GH_TOKEN:?GH_TOKEN is required}"
 export GITHUB_TOKEN="$GH_TOKEN"
 
-ISSUE="$1"
-
-# Prefer repo from git remote; fallback to titles-peeps/hushline
-REPO="${REPO:-$(git remote get-url origin 2>/dev/null | sed -nE 's#.*github.com[:/]+([^/]+/[^/.]+)(\.git)?$#\1#p')}"
+# Detect repo from git remote; fallback as requested
+REPO="${REPO:-$(git remote get-url origin 2>/dev/null | sed -n 's#.*github.com[:/]\(.*\.git\)#\1#p' | sed 's/\.git$//')}"
 REPO="${REPO:-titles-peeps/hushline}"
 
-# Model/endpoint (native Ollama path; avoids LiteLLM)
-export OLLAMA_API_BASE="${OLLAMA_API_BASE:-http://127.0.0.1:11434}"
-MODEL="${AIDER_MODEL:-ollama_chat/qwen2.5-coder:7b-instruct}"
+MODEL="${AIDER_MODEL:-ollama:qwen2.5-coder:7b-instruct}"
+ISSUE_NUM="${1:?usage: ops/agent.sh <issue_number>}"
 
-# Basic deps
+# Ensure tools
 for b in gh git aider; do
-  command -v "$b" >/dev/null || { echo "Missing dependency: $b" >&2; exit 1; }
+  command -v "$b" >/dev/null || { echo "missing: $b"; exit 1; }
 done
 
-# Ensure repo root and prompt template
-[[ -d .git ]] || { echo "Run from repo root"; exit 1; }
-[[ -f ops/agent_prompt.tmpl ]] || {
-  cat > ops/agent_prompt.tmpl <<'TPL'
-You are the Hush Line code assistant. Work only in this repository.
+# Fetch issue data (preserve newlines)
+ISSUE_TITLE="$(gh issue view "$ISSUE_NUM" -R "$REPO" --json title -q .title)"
+ISSUE_BODY="$(gh issue view "$ISSUE_NUM" -R "$REPO" --json body  -q .body)"
 
-Issue #: ${ISSUE_NUMBER}
-Title: ${ISSUE_TITLE}
-
-Task:
-- If change is backend/auth/CSP/crypto-critical:
-  * Add minimal pytest tests and implement the smallest fix.
-- If change is styles/markup/static-only:
-  * Implement directly (no tests required).
-- Preserve public APIs and security posture (CSP, TOTP, Tor, crypto).
-- Follow repo conventions (pytest, Black/isort). No new services/env vars.
-
-Output rules:
-- Return unified diffs only (no prose).
-
-Context (issue body follows):
-${ISSUE_BODY}
-TPL
-}
-
-# Fetch issue details
-ISSUE_TITLE="$(gh issue view "$ISSUE" -R "$REPO" --json title -q .title)"
-ISSUE_BODY="$(gh issue view "$ISSUE" -R "$REPO" --json body  -q .body)"
-
-# Default branch
+# Determine default branch
 DEFAULT_BRANCH="$(gh repo view "$REPO" --json defaultBranchRef -q .defaultBranchRef.name 2>/dev/null || true)"
 DEFAULT_BRANCH="${DEFAULT_BRANCH:-$(git remote show origin 2>/dev/null | sed -n 's/.*HEAD branch: //p')}"
 DEFAULT_BRANCH="${DEFAULT_BRANCH:-main}"
 
-# Create work branch
+# Create working branch
+BR="agent/issue-${ISSUE_NUM}-$(date +%Y%m%d-%H%M%S)"
 git fetch origin --prune
-BR="agent/issue-${ISSUE}-$(date +%Y%m%d-%H%M%S)"
-git checkout -B "$BR" "origin/${DEFAULT_BRANCH}"
+git checkout -B "$BR" "origin/$DEFAULT_BRANCH"
 
-# Build prompt
-export ISSUE_NUMBER="$ISSUE" ISSUE_TITLE ISSUE_BODY
-envsubst < ops/agent_prompt.tmpl > /tmp/agent_prompt.txt
+# Minimal prompt
+cat > /tmp/agent_prompt.txt <<EOF
+You are the Hush Line code assistant. Work only in this repository.
 
-# Try to extract explicit file paths from the issue body (generic)
-TARGET_FILES=()
-while IFS= read -r f; do
-  [[ -f "$f" ]] && TARGET_FILES+=("$f")
-done < <(echo "$ISSUE_BODY" | grep -Eo '([A-Za-z0-9._/-]+\.(py|js|ts|jsx|tsx|css|scss|sass|html|jinja2|sh|yml|yaml|toml|json))' | sort -u)
+Issue #: ${ISSUE_NUM}
+Title: ${ISSUE_TITLE}
 
-# Aider args (kept small & simple)
+Task:
+- Make the smallest necessary change to implement the issue.
+- Follow repo conventions; no new services/env vars.
+- Output unified diffs only (no prose).
+
+Context:
+${ISSUE_BODY}
+EOF
+
+# Try to hint Aider with any file paths mentioned in the body (generic, no CSS special-casing)
+mapfile -t TARGET_FILES < <(printf '%s\n' "$ISSUE_BODY" | grep -Eo '([A-Za-z0-9._/-]+\.(py|js|ts|tsx|jsx|css|scss|html|jinja2|yml|yaml|sh))' | sort -u | while read -r f; do [[ -f "$f" ]] && echo "$f"; done)
+
 AIDER_ARGS=(
   --yes
   --no-gitignore
@@ -84,37 +59,33 @@ AIDER_ARGS=(
   --no-stream
   --map-refresh files
   --map-multiplier-no-files 0
-  --map-tokens 512
-  --max-chat-history-tokens 1024
+  --map-tokens 256
+  --max-chat-history-tokens 768
 )
 
-# Run aider (with target files when we have them)
+# Run aider (single pass)
 if [[ ${#TARGET_FILES[@]} -gt 0 ]]; then
   aider "${AIDER_ARGS[@]}" --message "$(cat /tmp/agent_prompt.txt)" "${TARGET_FILES[@]}" || true
 else
   aider "${AIDER_ARGS[@]}" --message "$(cat /tmp/agent_prompt.txt)" || true
 fi
 
-# If no changes, say so and exit cleanly
+# If nothing changed, just note it and exit cleanly (keeps the system stable)
 if git diff --quiet && git diff --cached --quiet; then
-  gh issue comment "$ISSUE" -R "$REPO" -b "Agent attempted patch but produced no changes."
+  gh issue comment "$ISSUE_NUM" -R "$REPO" -b "Agent attempted patch but produced no changes."
   exit 0
 fi
 
-# Commit & push
+# Commit, push, PR
 git add -A
-git commit -m "Agent patch for #${ISSUE}: ${ISSUE_TITLE}" || true
+git commit -m "Agent patch for #${ISSUE_NUM}: ${ISSUE_TITLE}" || true
 git push -u origin "$BR"
 
-# Create PR
-EXISTING_PR="$(gh pr list -R "$REPO" --head "$BR" --json number -q '.[0].number')"
-if [[ -z "$EXISTING_PR" ]]; then
-  gh pr create -R "$REPO" \
-    -t "Agent patch for #${ISSUE}: ${ISSUE_TITLE}" \
-    -b "Automated patch for #${ISSUE}."
+PR_NUM="$(gh pr list -R "$REPO" --head "$BR" --json number -q '.[0].number' || true)"
+if [[ -z "$PR_NUM" ]]; then
+  gh pr create -R "$REPO" -t "Agent patch for #${ISSUE_NUM}: ${ISSUE_TITLE}" -b "Automated patch for #${ISSUE_NUM}."
 else
-  gh pr comment -R "$REPO" "$EXISTING_PR" -b "Updated patch."
+  gh pr comment -R "$REPO" "$PR_NUM" -b "Updated patch."
 fi
 
-# Link PR on the issue
-gh issue comment "$ISSUE" -R "$REPO" -b "Agent created/updated PR from branch \`$BR\`."
+gh issue comment "$ISSUE_NUM" -R "$REPO" -b "Agent created/updated PR from branch \`$BR\`."
