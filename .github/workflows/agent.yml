@@ -1,35 +1,80 @@
 name: run-agent
 
 on:
+  # Run when an issue is labeled "agent:run"
   issues:
     types: [labeled]
+  # Or manually from the Actions tab
+  workflow_dispatch:
+    inputs:
+      issue_num:
+        description: Issue number to work on
+        required: true
+        default: "1"
 
 jobs:
   agent:
-    # Only run when an issue receives the "agent" label
-    if: contains(github.event.label.name, 'agent')
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issues' && github.event.label.name == 'agent:run')
     runs-on: self-hosted
 
-    permissions:
-      contents: write
-      pull-requests: write
-      issues: write
-
     env:
-      # keep existing secret name
+      # === REQUIRED: do not rename these ===
       GH_TOKEN: ${{ secrets.AGENT_TOKEN }}
-      # pass the issue number to the script
-      ISSUE_NUM: ${{ github.event.issue.number }}
-      # local ollama endpoint
       OLLAMA_API_BASE: http://127.0.0.1:11434
-      # your chosen model name (unchanged token)
-      AIDER_MODEL: ollama:qwen2.5-coder:7b-instruct
+      # Force Aider's *native* Ollama adapter (not LiteLLM)
+      AIDER_MODEL: ollama_chat/qwen2.5-coder:7b-instruct
+
+      # Make it very hard for LiteLLM to get invoked accidentally
+      LITELLM_PROVIDER: ""
+      LITELLM_OLLAMA_BASE: ""
+      OPENAI_API_KEY: ""
+      ANTHROPIC_API_KEY: ""
+      MISTRAL_API_KEY: ""
+      TOGETHER_API_KEY: ""
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Show git remote
+        run: git remote -v
+
+      - name: Sanitize local Aider config (prevent model override)
+        run: |
+          rm -f .aider.conf.yml .aider.model.settings.yml .aider* || true
+          echo "Sanitized .aider* configs if present."
+
+      - name: Verify tools
+        run: |
+          which aider || { echo "aider not found in PATH"; exit 1; }
+          which gh || { echo "gh not found in PATH"; exit 1; }
+          which git || { echo "git not found in PATH"; exit 1; }
+
+      - name: Warm up Ollama (non-fatal)
+        continue-on-error: true
+        run: |
+          curl -fsS "$OLLAMA_API_BASE/api/tags" | head -c 200 || true
+
+      - name: Pick issue number
+        id: pick
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "ISSUE_NUM=${{ inputs.issue_num }}" >> $GITHUB_OUTPUT
+          else
+            echo "ISSUE_NUM=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
+          fi
+          echo "Will run on issue: $(cat $GITHUB_OUTPUT)"
 
       - name: Run agent
         shell: bash
+        env:
+          ISSUE_NUM: ${{ steps.pick.outputs.ISSUE_NUM }}
         run: |
+          set -euo pipefail
+          echo "Running for issue #$ISSUE_NUM"
           bash ops/agent.sh "$ISSUE_NUM"
