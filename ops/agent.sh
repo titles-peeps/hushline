@@ -13,16 +13,9 @@ ISSUE="$1"
 : "${GH_TOKEN:?GH_TOKEN missing}"
 export GITHUB_TOKEN="$GH_TOKEN"
 
-export OLLAMA_API_BASE="${OLLAMA_API_BASE:-http://127.0.0.1:11434}"
-export OLLAMA_HOST="${OLLAMA_HOST:-$OLLAMA_API_BASE}"
-export LITELLM_OLLAMA_BASE="${LITELLM_OLLAMA_BASE:-$OLLAMA_API_BASE}"
-
-AIDER_MODEL="${AIDER_MODEL:-ollama_chat/qwen2.5-coder:7b-instruct}"
-
-for b in gh git; do
+for b in gh git perl; do
   command -v "$b" >/dev/null || { echo "missing dependency: $b"; exit 1; }
 done
-command -v aider >/dev/null || AIDER_MISSING=1
 
 # --- repo & branch ---
 REPO="$(git config --get remote.origin.url | sed -E 's#.*[:/](.+/.+)\.git#\1#')"
@@ -35,84 +28,96 @@ git fetch origin --prune
 BR="agent/issue-${ISSUE}-$(date +%Y%m%d-%H%M%S)"
 git checkout -B "$BR" "origin/${DEFAULT_BRANCH}"
 
+# Ensure git identity
+git config user.name  >/dev/null 2>&1 || git config user.name  "hushline-agent"
+git config user.email >/dev/null 2>&1 || git config user.email "agent@users.noreply.github.com"
+
 # --- get issue text ---
 TITLE="$(gh issue view "$ISSUE" -R "$REPO" --json title -q .title)"
-BODY="$(gh issue view "$ISSUE"  -R "$REPO" --json body  -q .body)"
+BODY_FILE="$(mktemp)"
+gh issue view "$ISSUE" -R "$REPO" --json body -q .body > "$BODY_FILE"
 
-# --- deterministic patch path (no LLM) ---
-# 1) first file-like token
-FILE="$(printf '%s' "$BODY" | grep -Eo '[A-Za-z0-9._/-]+\.[A-Za-z0-9]+' | head -n1 || true)"
-# 2) first two backticked code snippets (inline or fenced)
-#    - grab the first two occurrences between backticks `
-OLD_SNIP="$(printf '%s' "$BODY" | perl -0777 -ne 'while(/`([^`]+)`/g){print "$1\n"}' | sed -n '1p' || true)"
-NEW_SNIP="$(printf '%s' "$BODY" | perl -0777 -ne 'while(/`([^`]+)`/g){print "$1\n"}' | sed -n '2p' || true)"
+trim() { sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
 
-did_change=0
-if [[ -n "${FILE:-}" && -f "$FILE" && -n "${OLD_SNIP:-}" && -n "${NEW_SNIP:-}" ]]; then
-  # replace the first occurrence only; preserve file if no match
-  tmp="$(mktemp)"
-  perl -0777 -pe '
-    BEGIN{ $old=$ENV{"OLD"}; $new=$ENV{"NEW"}; $done=0 }
-    if(!$done && index($_,$old) >= 0){
-      s/\Q$old\E/$new/ and $done=1;
-    }
-  ' OLD="$OLD_SNIP" NEW="$NEW_SNIP" "$FILE" > "$tmp" || true
+# --- resolve target file ---
+# 1) Prefer "Path to file: <path>" or "Path to file:\n`<path>`"
+FILE="$(awk '
+  BEGIN{ IGNORECASE=1; found=0 }
+  /^Path[[:space:]]+to[[:space:]]+file:/ { 
+    sub(/^Path[[:space:]]+to[[:space:]]+file:[[:space:]]*/,"");
+    gsub(/`/,"");
+    print; found=1; exit
+  }' "$BODY_FILE" | head -n1 | tr -d "\r" | sed "s/^ *//; s/ *$//")"
 
-  if ! cmp -s "$FILE" "$tmp"; then
-    mv "$tmp" "$FILE"
-    did_change=1
-  else
-    rm -f "$tmp"
-  fi
+# 2) If not found, pick first token that looks like a path and exists
+if [[ -z "${FILE:-}" ]]; then
+  while IFS= read -r cand; do
+    if [[ -f "$cand" ]]; then FILE="$cand"; break; fi
+  done < <(grep -Eo '[A-Za-z0-9._/-]+\.[A-Za-z0-9]+' "$BODY_FILE" | sort -u)
 fi
 
-# --- fallback to Aider if no change and aider exists ---
-if [[ "$did_change" -eq 0 ]]; then
-  if [[ -z "${AIDER_MISSING:-}" ]]; then
-    # minimal prompt
-    PROMPT_FILE="$(mktemp)"
-    cat > "$PROMPT_FILE" <<EOF
-You are the Hush Line code assistant. Work only in this repository.
+# --- extract old/new snippets (first two backticked spans) ---
+OLD="$(perl -0777 -ne 'while(/`([^`]+)`/g){print "$1\n"}' "$BODY_FILE" | sed -n '1p' | tr -d "\r")"
+NEW="$(perl -0777 -ne 'while(/`([^`]+)`/g){print "$1\n"}' "$BODY_FILE" | sed -n '2p' | tr -d "\r")"
 
-Task:
-- Make the change requested in the referenced issue.
-- Keep the diff minimal.
-- Output unified diffs only (no prose).
-- Edit only existing files.
-
-Title: ${TITLE}
-
-Body:
-${BODY}
-EOF
-
-    AARGS=( --yes --no-gitignore --model "$AIDER_MODEL" --edit-format udiff --timeout 600 )
-    if [[ -n "${FILE:-}" && -f "$FILE" ]]; then
-      aider "${AARGS[@]}" --message "$(cat "$PROMPT_FILE")" "$FILE" || true
-    else
-      aider "${AARGS[@]}" --message "$(cat "$PROMPT_FILE")" || true
-    fi
-  else
-    echo "aider not installed; skipping LLM fallback" >&2
-  fi
+# --- guardrails and helpful comments ---
+if [[ -z "${FILE:-}" ]]; then
+  gh issue comment "$ISSUE" -R "$REPO" -b "Agent: No file path found in the issue. Please add a line like:
+\`Path to file: relative/path/to/file.ext\`"
+  exit 0
 fi
 
-# --- no changes? tell the issue and exit gracefully ---
-if git diff --quiet && git diff --cached --quiet; then
-  gh issue comment "$ISSUE" -R "$REPO" -b "Agent attempted a patch but produced no changes."
+if [[ ! -f "$FILE" ]]; then
+  gh issue comment "$ISSUE" -R "$REPO" -b "Agent: File not found: \`$FILE\`. Please verify the path."
+  exit 0
+fi
+
+if [[ -z "${OLD:-}" || -z "${NEW:-}" ]]; then
+  gh issue comment "$ISSUE" -R "$REPO" -b "Agent: Could not find two backticked snippets in the issue body (old → new). Please provide:
+\`\`\`
+old code in \`backticks\`
+new code in \`backticks\`
+\`\`\`"
+  exit 0
+fi
+
+# --- apply single replacement (first occurrence) ---
+TMP="$(mktemp)"
+changed=0
+perl -0777 -pe '
+  BEGIN { $old=$ENV{"OLD"}; $new=$ENV{"NEW"}; $done=0 }
+  if (!$done && index($_,$old) >= 0) { s/\Q$old\E/$new/ and $done=1; }
+  END { if(!$done){ exit 2 } }
+' OLD="$OLD" NEW="$NEW" "$FILE" > "$TMP" || rc=$?
+
+if [[ ${rc:-0} -eq 2 ]]; then
+  rm -f "$TMP"
+  gh issue comment "$ISSUE" -R "$REPO" -b "Agent: The specified snippet was not found in \`$FILE\`. No changes made."
+  exit 0
+fi
+
+if ! cmp -s "$FILE" "$TMP"; then
+  mv "$TMP" "$FILE"
+  changed=1
+else
+  rm -f "$TMP"
+fi
+
+if [[ "$changed" -ne 1 ]]; then
+  gh issue comment "$ISSUE" -R "$REPO" -b "Agent: No modifications were necessary."
   exit 0
 fi
 
 # --- commit / push / PR ---
 git add -A
-git commit -m "Agent patch for #${ISSUE}: ${TITLE}" || true
+git commit -m "Agent patch for #${ISSUE}: ${TITLE}"
 git push -u origin "$BR"
 
-EXISTING_PR="$(gh pr list -R "$REPO" --head "$BR" --json number -q '.[0].number')"
-if [[ -z "$EXISTING_PR" ]]; then
+PR_NUM="$(gh pr list -R "$REPO" --head "$BR" --json number -q '.[0].number')"
+if [[ -z "$PR_NUM" ]]; then
   gh pr create -R "$REPO" -t "Agent patch for #${ISSUE}: ${TITLE}" -b "Automated patch for #${ISSUE}."
 else
-  gh pr comment -R "$REPO" "$EXISTING_PR" -b "Updated patch."
+  gh pr comment -R "$REPO" "$PR_NUM" -b "Updated patch."
 fi
 
-gh issue comment "$ISSUE" -R "$REPO" -b "Agent created/updated PR from \`$BR\`."
+gh issue comment "$ISSUE" -R "$REPO" -b "Agent created/updated PR from \`$BR\` targeting \`${DEFAULT_BRANCH}\`."
