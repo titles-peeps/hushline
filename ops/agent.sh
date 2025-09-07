@@ -9,26 +9,24 @@ fi
 
 ISSUE="$1"
 
-# --- Minimal env & deps ---
+# --- minimal env & deps ---
 : "${GH_TOKEN:?GH_TOKEN missing}"
 export GITHUB_TOKEN="$GH_TOKEN"
 
-# Point EVERYONE at the same Ollama endpoint:
 export OLLAMA_API_BASE="${OLLAMA_API_BASE:-http://127.0.0.1:11434}"
 export OLLAMA_HOST="${OLLAMA_HOST:-$OLLAMA_API_BASE}"
-# LiteLLM expects this exact var name for Ollama
 export LITELLM_OLLAMA_BASE="${LITELLM_OLLAMA_BASE:-$OLLAMA_API_BASE}"
 
-# Model: the aider-native Ollama chat driver
 AIDER_MODEL="${AIDER_MODEL:-ollama_chat/qwen2.5-coder:7b-instruct}"
 
-for bin in gh git aider; do
-  command -v "$bin" >/dev/null || { echo "missing dependency: $bin"; exit 1; }
+for b in gh git; do
+  command -v "$b" >/dev/null || { echo "missing dependency: $b"; exit 1; }
 done
+command -v aider >/dev/null || AIDER_MISSING=1
 
-# --- Repo & branch ---
+# --- repo & branch ---
 REPO="$(git config --get remote.origin.url | sed -E 's#.*[:/](.+/.+)\.git#\1#')"
-[[ -z "${REPO}" ]] && REPO="titles-peeps/hushline"
+[[ -z "$REPO" ]] && REPO="titles-peeps/hushline"
 
 DEFAULT_BRANCH="$(gh repo view "$REPO" --json defaultBranchRef -q .defaultBranchRef.name 2>/dev/null || true)"
 [[ -z "$DEFAULT_BRANCH" ]] && DEFAULT_BRANCH="main"
@@ -37,11 +35,43 @@ git fetch origin --prune
 BR="agent/issue-${ISSUE}-$(date +%Y%m%d-%H%M%S)"
 git checkout -B "$BR" "origin/${DEFAULT_BRANCH}"
 
-# --- Tiny prompt ---
+# --- get issue text ---
 TITLE="$(gh issue view "$ISSUE" -R "$REPO" --json title -q .title)"
 BODY="$(gh issue view "$ISSUE"  -R "$REPO" --json body  -q .body)"
 
-cat > /tmp/agent_prompt.txt <<EOF
+# --- deterministic patch path (no LLM) ---
+# 1) first file-like token
+FILE="$(printf '%s' "$BODY" | grep -Eo '[A-Za-z0-9._/-]+\.[A-Za-z0-9]+' | head -n1 || true)"
+# 2) first two backticked code snippets (inline or fenced)
+#    - grab the first two occurrences between backticks `
+OLD_SNIP="$(printf '%s' "$BODY" | perl -0777 -ne 'while(/`([^`]+)`/g){print "$1\n"}' | sed -n '1p' || true)"
+NEW_SNIP="$(printf '%s' "$BODY" | perl -0777 -ne 'while(/`([^`]+)`/g){print "$1\n"}' | sed -n '2p' || true)"
+
+did_change=0
+if [[ -n "${FILE:-}" && -f "$FILE" && -n "${OLD_SNIP:-}" && -n "${NEW_SNIP:-}" ]]; then
+  # replace the first occurrence only; preserve file if no match
+  tmp="$(mktemp)"
+  perl -0777 -pe '
+    BEGIN{ $old=$ENV{"OLD"}; $new=$ENV{"NEW"}; $done=0 }
+    if(!$done && index($_,$old) >= 0){
+      s/\Q$old\E/$new/ and $done=1;
+    }
+  ' OLD="$OLD_SNIP" NEW="$NEW_SNIP" "$FILE" > "$tmp" || true
+
+  if ! cmp -s "$FILE" "$tmp"; then
+    mv "$tmp" "$FILE"
+    did_change=1
+  else
+    rm -f "$tmp"
+  fi
+fi
+
+# --- fallback to Aider if no change and aider exists ---
+if [[ "$did_change" -eq 0 ]]; then
+  if [[ -z "${AIDER_MISSING:-}" ]]; then
+    # minimal prompt
+    PROMPT_FILE="$(mktemp)"
+    cat > "$PROMPT_FILE" <<EOF
 You are the Hush Line code assistant. Work only in this repository.
 
 Task:
@@ -56,35 +86,24 @@ Body:
 ${BODY}
 EOF
 
-# Optional: pass any explicit file paths found in the issue body,
-# so aider doesn't have to consider the whole tree.
-mapfile -t TARGETS < <(printf "%s" "$BODY" | grep -Eo '([A-Za-z0-9._/-]+\.(py|js|ts|tsx|jsx|css|scss|html|jinja2|sh|yml|yaml))' | sort -u || true)
-EXISTING_TARGETS=()
-for f in "${TARGETS[@]:-}"; do
-  [[ -f "$f" ]] && EXISTING_TARGETS+=("$f")
-done
-
-AIDER_ARGS=(
-  --yes
-  --no-gitignore
-  --model "$AIDER_MODEL"
-  --edit-format udiff
-  --timeout 120
-)
-
-if (( ${#EXISTING_TARGETS[@]} > 0 )); then
-  aider "${AIDER_ARGS[@]}" --message "$(cat /tmp/agent_prompt.txt)" "${EXISTING_TARGETS[@]}" || true
-else
-  aider "${AIDER_ARGS[@]}" --message "$(cat /tmp/agent_prompt.txt)" || true
+    AARGS=( --yes --no-gitignore --model "$AIDER_MODEL" --edit-format udiff --timeout 600 )
+    if [[ -n "${FILE:-}" && -f "$FILE" ]]; then
+      aider "${AARGS[@]}" --message "$(cat "$PROMPT_FILE")" "$FILE" || true
+    else
+      aider "${AARGS[@]}" --message "$(cat "$PROMPT_FILE")" || true
+    fi
+  else
+    echo "aider not installed; skipping LLM fallback" >&2
+  fi
 fi
 
-# If nothing changed, exit cleanly with a comment.
+# --- no changes? tell the issue and exit gracefully ---
 if git diff --quiet && git diff --cached --quiet; then
   gh issue comment "$ISSUE" -R "$REPO" -b "Agent attempted a patch but produced no changes."
   exit 0
 fi
 
-# Commit & PR
+# --- commit / push / PR ---
 git add -A
 git commit -m "Agent patch for #${ISSUE}: ${TITLE}" || true
 git push -u origin "$BR"

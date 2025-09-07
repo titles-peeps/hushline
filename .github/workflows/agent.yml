@@ -19,9 +19,7 @@ jobs:
 
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      # One URL — we wire this to both Aider & LiteLLM below
       OLLAMA_API_BASE: http://127.0.0.1:11434
-      # Minimal model
       AIDER_MODEL: ollama_chat/qwen2.5-coder:7b-instruct
 
     steps:
