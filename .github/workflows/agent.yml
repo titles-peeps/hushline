@@ -1,82 +1,74 @@
-# .github/workflows/agent.yml
-name: agent
+name: run-agent
 
 on:
-  issues:
-    types: [labeled]
+  # Manual run from the Actions tab
   workflow_dispatch:
     inputs:
       issue:
         description: "Issue number to work on"
         required: true
         type: string
+  # Optional: auto-run when a label is added to an issue
+  issues:
+    types: [labeled]
 
-permissions:
-  contents: write
-  pull-requests: write
-  issues: write
+env:
+  # Model & Ollama defaults (override in repo/Org secrets if needed)
+  OLLAMA_API_BASE: http://127.0.0.1:11434
+  OLLAMA_HOST: http://127.0.0.1:11434
+  AIDER_MODEL: ollama_chat/qwen2.5-coder:7b-instruct
 
 jobs:
-  run-agent:
+  run:
+    # Use your self-hosted ARM64 runner
     runs-on: self-hosted
 
-    env:
-      GH_TOKEN: ${{ secrets.GH_TOKEN }}
-      FLASK_ENV: test
-      DATABASE_URL: sqlite:///./test.db
-      OLLAMA_API_BASE: http://127.0.0.1:11434
-      OLLAMA_HOST: http://127.0.0.1:11434
-      VENV: ${{ github.workspace }}/.venv
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Sanity check deps (self-hosted)
-        run: |
-          for b in jq curl; do
-            command -v "$b" >/dev/null || { echo "Missing $b on self-hosted runner"; exit 1; }
-          done
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Create venv & install deps
-        run: |
-          python -m venv "$VENV"
-          source "$VENV/bin/activate"
-          pip install --upgrade pip
-          pip install "aider-chat==0.86.1" pytest
-
-      - name: Make agent executable
-        run: chmod +x ops/agent.sh
-
-      - name: Resolve issue number
+      - name: Determine issue number
         id: issue
         shell: bash
         run: |
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             echo "num=${{ inputs.issue }}" >> "$GITHUB_OUTPUT"
           else
+            # issues:labeled path
             echo "num=${{ github.event.issue.number }}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Warm up Ollama
-        continue-on-error: true
-        run: |
-          set -e
-          curl -fsS "$OLLAMA_API_BASE/api/tags" | jq -r '.models[].name' || true
-          curl -fsS "$OLLAMA_API_BASE/api/pull" \
-            -H 'Content-Type: application/json' \
-            -d '{"model":"qwen2.5-coder:7b-instruct"}' || true
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Run agent
-        env:
-          PATH: ${{ env.VENV }}/bin:${{ env.PATH }}
+      # Make sure line endings are LF and script is executable
+      - name: Normalize agent.sh (LF) & chmod
+        shell: bash
         run: |
-          echo "DATABASE_URL=${DATABASE_URL}" >> "$GITHUB_ENV"
-          ./ops/agent.sh "${{ steps.issue.outputs.num }}"
+          sed -i 's/\r$//' ops/agent.sh
+          chmod +x ops/agent.sh
+
+      # Optional: pre-pull model so Aider doesn’t block
+      - name: Warm up Ollama
+        shell: bash
+        env:
+          OLLAMA_API_BASE: ${{ env.OLLAMA_API_BASE }}
+          AIDER_MODEL: ${{ env.AIDER_MODEL }}
+        run: |
+          model="${AIDER_MODEL#*/}"          # strip "ollama_chat/" if present
+          model="${model#ollama/}"           # strip "ollama/" if present
+          model="${model:-qwen2.5-coder:7b-instruct}"
+          echo "Pulling model: $model"
+          curl -fsS -X POST "$OLLAMA_API_BASE/api/pull" \
+            -H 'Content-Type: application/json' \
+            -d "{\"model\":\"$model\"}" || true
+
+      # Run the agent (call via 'bash' to avoid CRLF shebang issues)
+      - name: Run agent
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OLLAMA_API_BASE: ${{ env.OLLAMA_API_BASE }}
+          OLLAMA_HOST: ${{ env.OLLAMA_HOST }}
+          AIDER_MODEL: ${{ env.AIDER_MODEL }}
+        run: |
+          bash ops/agent.sh "${{ steps.issue.outputs.num }}"
