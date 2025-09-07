@@ -1,99 +1,64 @@
-name: hushline-agent
+name: Agent
 
 on:
   workflow_dispatch:
     inputs:
       issue:
-        description: "Issue number to work on"
+        description: "Issue number to run agent on"
         required: true
   issues:
     types: [labeled]
 
 permissions:
-  contents: write        # push branches
-  pull-requests: write   # open/comment PRs
-  issues: write          # comment on issues
+  contents: write
+  pull-requests: write
+  issues: write
 
 concurrency:
-  group: agent-${{ github.ref || format('issue-{0}', github.event.issue.number) }}
+  group: agent-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  run:
-    if: >
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'issues' && github.event.action == 'labeled' && github.event.label.name == 'agent')
+  run-agent:
+    if: github.event_name == 'workflow_dispatch' || (github.event.label.name == 'agent')
     runs-on: self-hosted
-
-    timeout-minutes: 30
-
     env:
-      # App env
-      DATABASE_URL: sqlite:///./test.db
-      FLASK_ENV: test
-      # Auth for gh CLI used by ops/agent.sh
-      GH_TOKEN: ${{ secrets.GH_TOKEN }}
-
+      REPO: ${{ github.repository }}
+      ISSUE: ${{ github.event.inputs.issue || github.event.issue.number }}
+      GITHUB_TOKEN: ${{ secrets.AGENT_TOKEN }}
     steps:
-      - name: Checkout
+      - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Show context
+        run: |
+          echo "Repository: $REPO"
+          echo "Issue: $ISSUE"
+          uname -a
+          free -h
+          df -h
+
+      - name: Tool versions
+        run: |
+          git --version
+          gh --version
+          aider --version || true
+          curl -s http://127.0.0.1:11434/api/version || echo "Ollama not responding"
+
+      - name: Run agent script (verbose)
+        run: |
+          set -x
+          bash ./ops/agent.sh "$ISSUE" 2>&1 | tee agent-run.log
+
+      - name: Upload run log
+        uses: actions/upload-artifact@v4
         with:
-          fetch-depth: 0
+          name: agent-run-log
+          path: agent-run.log
 
-      - name: Figure out issue number
-        id: pick
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "issue=${{ inputs.issue }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "issue=${{ github.event.issue.number }}" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Quick tool sanity
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "::group::versions"
-          command -v git && git --version
-          command -v gh && gh --version
-          command -v bash && bash --version | head -n1
-          command -v curl && curl --version | head -n1
-          command -v jq && jq --version
-          echo "::endgroup::"
-          # Ensure the script is executable
-          chmod +x ops/agent.sh
-
-      - name: Ollama health check (non-fatal)
-        shell: bash
-        continue-on-error: true
-        run: |
-          set -euo pipefail
-          : "${OLLAMA_API_BASE:=http://127.0.0.1:11434}"
-          echo "Using OLLAMA_API_BASE=$OLLAMA_API_BASE"
-          curl -sSf "$OLLAMA_API_BASE/api/tags" | jq '.models | length'
-
-      - name: Run agent (debug)
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "DATABASE_URL=${DATABASE_URL}" >> "$GITHUB_ENV"
-          echo "::group::agent-run"
-          bash -x ./ops/agent.sh "${{ steps.pick.outputs.issue }}" 2>&1 | tee agent.log
-          echo "::endgroup::"
-        env:
-          # Optional hints for your script; harmless if unused
-          OLLAMA_API_BASE: ${{ env.OLLAMA_API_BASE }}
-          OLLAMA_HOST: ${{ env.OLLAMA_API_BASE }}
-
-      - name: Upload agent artifacts
+      - name: Upload aider history
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: agent-artifacts-${{ steps.pick.outputs.issue }}
-          path: |
-            agent.log
-            .aider.chat.history.md
-            .aider.input.history
-          if-no-files-found: ignore
+          name: aider-history
+          path: .aider.input.history
