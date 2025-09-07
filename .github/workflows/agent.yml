@@ -3,42 +3,53 @@ name: run-agent
 on:
   workflow_dispatch:
     inputs:
-      issue_number:
-        description: "Issue number"
-        required: true
+      issue:
+        description: "Issue number to run against"
+        required: false
   issues:
     types: [labeled]
 
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
 jobs:
   agent:
-    if: |
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'issues' && contains(github.event.label.name, 'agent:run'))
     runs-on: self-hosted
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          fetch-depth: 0
+          python-version: "3.11"
+
+      - name: Make agent script executable
+        run: |
+          sed -i 's/\r$//' ops/agent.sh
+          chmod +x ops/agent.sh
+
+      - name: Warm up Ollama (best-effort)
+        run: |
+          curl -s -X POST http://127.0.0.1:11434/api/pull \
+            -d '{"model":"qwen2.5-coder:7b-instruct"}' || true
 
       - name: Resolve issue number
         id: issue
         run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "NUM=${{ github.event.inputs.issue_number }}" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "ISSUE_NUM=${{ github.event.inputs.issue }}" >> $GITHUB_ENV
           else
-            echo "NUM=${{ github.event.issue.number }}" >> "$GITHUB_OUTPUT"
+            echo "ISSUE_NUM=${{ github.event.issue.number }}" >> $GITHUB_ENV
           fi
 
-      - name: Warm up Ollama (best effort)
-        run: |
-          curl -fsS "${OLLAMA_API_BASE:-http://127.0.0.1:11434}/api/tags" || true
-
       - name: Run agent
+        run: bash ops/agent.sh "$ISSUE_NUM"
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          OLLAMA_API_BASE: ${{ vars.OLLAMA_API_BASE || 'http://127.0.0.1:11434' }}
-          AIDER_MODEL: ${{ vars.AIDER_MODEL || 'ollama_chat/qwen2.5-coder:7b-instruct' }}
-        run: |
-          bash ops/agent.sh "${{ steps.issue.outputs.NUM }}"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OLLAMA_API_BASE: http://127.0.0.1:11434
+          LITELLM_PROVIDER: ollama
+          LITELLM_OLLAMA_BASE: http://127.0.0.1:11434
