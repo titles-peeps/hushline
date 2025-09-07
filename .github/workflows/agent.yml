@@ -1,39 +1,35 @@
-name: Agent Automation
+name: run-agent
+
 on:
   issues:
     types: [labeled]
 
 jobs:
-  run-agent:
-    if: ${{ github.event.label.name == 'agent' }}
+  agent:
+    # Only run when an issue receives the "agent" label
+    if: contains(github.event.label.name, 'agent')
     runs-on: self-hosted
+
     permissions:
       contents: write
-      issues: write
       pull-requests: write
+      issues: write
+
+    env:
+      # keep existing secret name
+      GH_TOKEN: ${{ secrets.AGENT_TOKEN }}
+      # pass the issue number to the script
+      ISSUE_NUM: ${{ github.event.issue.number }}
+      # local ollama endpoint
+      OLLAMA_API_BASE: http://127.0.0.1:11434
+      # your chosen model name (unchanged token)
+      AIDER_MODEL: ollama:qwen2.5-coder:7b-instruct
+
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Print context (debug)
-        run: |
-          echo "Issue: #${{ github.event.issue.number }} - ${{ github.event.issue.title }}"
-          echo "Label: ${{ github.event.label.name }}"
-
-      - name: Ensure dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y git jq python3-pip
-          pip3 install --upgrade pip
-          pip3 install --no-cache-dir black isort
-
-      - name: Verify Ollama availability
-        run: |
-          which ollama || true
-          ollama --version
-          ollama list || true
-
       - name: Run agent
-        env:
-          AGENT_TOKEN: ${{ secrets.AGENT_TOKEN }}
-        run: bash ops/agent.sh
+        shell: bash
+        run: |
+          bash ops/agent.sh "$ISSUE_NUM"
