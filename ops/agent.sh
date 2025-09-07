@@ -9,22 +9,24 @@ fi
 
 ISSUE="$1"
 
-# -------- Minimal env & deps --------
+# --- Minimal env & deps ---
 : "${GH_TOKEN:?GH_TOKEN missing}"
 export GITHUB_TOKEN="$GH_TOKEN"
 
-# Ensure we always use Ollama via LiteLLM when Aider shells out
+# Point EVERYONE at the same Ollama endpoint:
 export OLLAMA_API_BASE="${OLLAMA_API_BASE:-http://127.0.0.1:11434}"
-export LITELLM_PROVIDER="${LITELLM_PROVIDER:-ollama}"
+export OLLAMA_HOST="${OLLAMA_HOST:-$OLLAMA_API_BASE}"
+# LiteLLM expects this exact var name for Ollama
+export LITELLM_OLLAMA_BASE="${LITELLM_OLLAMA_BASE:-$OLLAMA_API_BASE}"
 
-# Keep model simple & native to Aider
-AIDER_MODEL="${AIDER_MODEL:-ollama:qwen2.5-coder:7b-instruct}"
+# Model: the aider-native Ollama chat driver
+AIDER_MODEL="${AIDER_MODEL:-ollama_chat/qwen2.5-coder:7b-instruct}"
 
 for bin in gh git aider; do
   command -v "$bin" >/dev/null || { echo "missing dependency: $bin"; exit 1; }
 done
 
-# -------- Repo & branch --------
+# --- Repo & branch ---
 REPO="$(git config --get remote.origin.url | sed -E 's#.*[:/](.+/.+)\.git#\1#')"
 [[ -z "${REPO}" ]] && REPO="titles-peeps/hushline"
 
@@ -35,35 +37,33 @@ git fetch origin --prune
 BR="agent/issue-${ISSUE}-$(date +%Y%m%d-%H%M%S)"
 git checkout -B "$BR" "origin/${DEFAULT_BRANCH}"
 
-# -------- Build prompt (tiny & direct) --------
-TITLE="$(gh issue view "$ISSUE" -R "$REPO" --json title  -q .title)"
-BODY="$(gh issue view "$ISSUE"  -R "$REPO" --json body   -q .body)"
+# --- Tiny prompt ---
+TITLE="$(gh issue view "$ISSUE" -R "$REPO" --json title -q .title)"
+BODY="$(gh issue view "$ISSUE"  -R "$REPO" --json body  -q .body)"
 
-PROMPT=$(
-cat <<'EOF'
+cat > /tmp/agent_prompt.txt <<EOF
 You are the Hush Line code assistant. Work only in this repository.
 
 Task:
 - Make the change requested in the referenced issue.
 - Keep the diff minimal.
-- Do not invent files. Edit only existing files.
-- Output must be unified diffs only (no prose).
+- Output unified diffs only (no prose).
+- Edit only existing files.
 
-Issue context follows:
+Title: ${TITLE}
 
+Body:
+${BODY}
 EOF
-)
-printf "%s\n\nTitle: %s\n\nBody:\n%s\n" "$PROMPT" "$TITLE" "$BODY" > /tmp/agent_prompt.txt
 
-# Heuristic: add any paths that look like real repo files so aider
-# can avoid scanning the whole tree.
-mapfile -t TARGETS < <(printf "%s" "$BODY" | grep -Eo '([A-Za-z0-9._/-]+\.(py|js|ts|tsx|jsx|css|scss|html|jinja2|sh|yml|yaml))' | sort -u)
+# Optional: pass any explicit file paths found in the issue body,
+# so aider doesn't have to consider the whole tree.
+mapfile -t TARGETS < <(printf "%s" "$BODY" | grep -Eo '([A-Za-z0-9._/-]+\.(py|js|ts|tsx|jsx|css|scss|html|jinja2|sh|yml|yaml))' | sort -u || true)
 EXISTING_TARGETS=()
 for f in "${TARGETS[@]:-}"; do
   [[ -f "$f" ]] && EXISTING_TARGETS+=("$f")
 done
 
-# -------- Run aider once --------
 AIDER_ARGS=(
   --yes
   --no-gitignore
@@ -78,13 +78,13 @@ else
   aider "${AIDER_ARGS[@]}" --message "$(cat /tmp/agent_prompt.txt)" || true
 fi
 
-# -------- If nothing changed, exit gracefully --------
+# If nothing changed, exit cleanly with a comment.
 if git diff --quiet && git diff --cached --quiet; then
   gh issue comment "$ISSUE" -R "$REPO" -b "Agent attempted a patch but produced no changes."
   exit 0
 fi
 
-# -------- Commit & PR --------
+# Commit & PR
 git add -A
 git commit -m "Agent patch for #${ISSUE}: ${TITLE}" || true
 git push -u origin "$BR"

@@ -19,11 +19,10 @@ jobs:
 
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # One URL — we wire this to both Aider & LiteLLM below
       OLLAMA_API_BASE: http://127.0.0.1:11434
-      # Force aider/LiteLLM to the Ollama backend
-      LITELLM_PROVIDER: ollama
-      # Optional: silence the model warning spam
-      AIDER_MODEL: ollama:qwen2.5-coder:7b-instruct
+      # Minimal model
+      AIDER_MODEL: ollama_chat/qwen2.5-coder:7b-instruct
 
     steps:
       - name: Checkout
@@ -31,10 +30,10 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Warm up Ollama model (best-effort)
+      - name: Warm up Ollama (best effort)
         run: |
           set -e
-          curl -fsS "$OLLAMA_API_BASE/api/tags" | jq . >/dev/null || exit 0
+          curl -fsS "$OLLAMA_API_BASE/api/tags" >/dev/null || exit 0
           curl -fsS -X POST "$OLLAMA_API_BASE/api/pull" \
             -H 'Content-Type: application/json' \
             -d '{"model":"qwen2.5-coder:7b-instruct"}' || true
