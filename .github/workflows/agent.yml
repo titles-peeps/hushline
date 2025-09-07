@@ -1,50 +1,66 @@
 name: run-agent
 
 on:
+  # Click “Run workflow” OR pass an issue number from the UI
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: "Issue number to work on"
+        required: true
+  # Auto-run when a label is added to an issue
   issues:
     types: [labeled]
 
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
 jobs:
-  run:
-    if: contains(github.event.label.name, 'run-agent')
+  agent:
+    # Run if:
+    # - manually dispatched OR
+    # - an issue was labeled with "agent" or "run-agent"
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issues' &&
+       (github.event.action == 'labeled') &&
+       contains('agent,run-agent', github.event.label.name))
     runs-on: self-hosted
 
+    # Required env (names unchanged as requested)
     env:
       GH_TOKEN: ${{ secrets.AGENT_TOKEN }}
-      # Talk directly to local Ollama:
       OLLAMA_API_BASE: http://127.0.0.1:11434
-      # IMPORTANT: use the SLASH form so Aider uses native Ollama client
+      # Use Aider’s native Ollama adapter (NOT litellm)
       AIDER_MODEL: ollama_chat/qwen2.5-coder:7b-instruct
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Show runner basics
-        run: |
-          echo "Runner: $(uname -a)"
-          echo "Python: $(python3 -V || true)"
-          echo "Ollama API: ${OLLAMA_API_BASE}"
-
-      - name: Warm up Ollama (pull model if missing)
-        shell: bash
+      - name: Resolve issue number
         run: |
           set -euo pipefail
-          curl -fsS "$OLLAMA_API_BASE/api/tags" | jq -r '.models[].name' || true
-          if ! curl -fsS "$OLLAMA_API_BASE/api/tags" \
-             | jq -e --arg m "$(echo '${{ env.AIDER_MODEL }}' | sed 's#.*[/]\(.*\)#\1#')" \
-                  '.models[].name | contains($m)' >/dev/null; then
-            plain="$(echo '${{ env.AIDER_MODEL }}' | sed 's#.*[/]\(.*\)#\1#')"
-            echo "Pulling model: $plain"
-            curl -fsS "$OLLAMA_API_BASE/api/pull" \
-              -H 'Content-Type: application/json' \
-              -d "{\"model\":\"$plain\"}"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "ISSUE_NUM=${{ github.event.inputs.issue }}" >> "$GITHUB_ENV"
+          else
+            echo "ISSUE_NUM=${{ github.event.issue.number }}" >> "$GITHUB_ENV"
           fi
+          echo "Will run agent on issue #$ISSUE_NUM"
 
       - name: Run agent
-        shell: bash
         env:
-          ISSUE_NUM: ${{ github.event.issue.number }}
+          GH_TOKEN: ${{ env.GH_TOKEN }}
+          OLLAMA_API_BASE: ${{ env.OLLAMA_API_BASE }}
+          AIDER_MODEL: ${{ env.AIDER_MODEL }}
+          # Make sure nothing routes through LiteLLM
+          LITELLM_PROVIDER: ""
+          LITELLM_OLLAMA_BASE: ""
+          OPENAI_API_KEY: ""
+          ANTHROPIC_API_KEY: ""
         run: |
           set -euo pipefail
           bash ops/agent.sh "$ISSUE_NUM"
