@@ -14,12 +14,11 @@ ISSUE="$1"
 if [[ -n "${REPO:-}" ]]; then
   REPO="$REPO"
 else
-  # Try to parse from origin url
   origin_url="$(git config --get remote.origin.url || true)"
   if [[ "$origin_url" =~ github.com[:/](.+)/(.+)\.git$ ]]; then
     REPO="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
   else
-    REPO="titles-peeps/hushline"  # fallback
+    REPO="titles-peeps/hushline"
   fi
 fi
 
@@ -27,7 +26,7 @@ fi
 : "${GH_TOKEN:?GH_TOKEN must be set in env}"
 export GITHUB_TOKEN="$GH_TOKEN"
 
-# --- Model/runtime knobs (friendly to small devices) ---------------------------
+# --- Model/runtime knobs -------------------------------------------------------
 export OLLAMA_API_BASE="${OLLAMA_API_BASE:-http://127.0.0.1:11434}"
 export OLLAMA_HOST="${OLLAMA_HOST:-http://127.0.0.1:11434}"
 export OLLAMA_NUM_PARALLEL=1
@@ -35,7 +34,8 @@ export OLLAMA_KEEP_ALIVE=10m
 export AIDER_ANALYTICS_DISABLE=1
 unset LITELLM_PROVIDER LITELLM_OLLAMA_BASE OPENAI_API_KEY ANTHROPIC_API_KEY
 
-MODEL="${AIDER_MODEL:-ollama_chat/qwen2.5-coder:7b-instruct}"
+# IMPORTANT: real Ollama provider (not litellm alias)
+MODEL="${AIDER_MODEL:-ollama:qwen2.5-coder:7b-instruct}"
 
 # --- Sanity checks -------------------------------------------------------------
 [[ -d .git ]] || { echo "must run in repo root"; exit 1; }
@@ -48,22 +48,21 @@ for bin in gh git aider curl jq; do
   command -v "$bin" >/dev/null || { echo "missing dependency: $bin"; exit 1; }
 done
 
-# --- Ollama health + pre-pull model -------------------------------------------
+# --- Ollama health + pre-pull --------------------------------------------------
 set +e
 curl -fsS "${OLLAMA_API_BASE}/api/tags" | jq -r '.models[].name' >/dev/null
 HEALTH_RC=$?
 set -e
 [[ $HEALTH_RC -ne 0 ]] && { echo "ollama health check failed"; exit 1; }
 
-# pre-pull the plain model id if missing (strip provider prefix)
-plain_model="${MODEL#*/}"
-if ! curl -fsS "${OLLAMA_API_BASE}/api/tags" | jq -e --arg m "$plain_model" '.models[].name | contains($m)' >/dev/null; then
+plain_model="${MODEL#ollama:}"
+if ! curl -fsS "${OLLAMA_API_BASE}/api/tags" | jq -e --arg m "$plain_model" '([.models[].name] | join(" ")) | contains($m)' >/dev/null; then
   curl -fsS "${OLLAMA_API_BASE}/api/pull" \
     -H 'Content-Type: application/json' \
     -d "{\"model\":\"${plain_model}\"}" >/dev/null
 fi
 
-# --- Issue data ---------------------------------------------------------------
+# --- Issue data ----------------------------------------------------------------
 ISSUE_TITLE="$(gh issue view "$ISSUE" -R "$REPO" --json title -q .title)"
 ISSUE_BODY="$(gh issue view "$ISSUE" -R "$REPO" --json body  -q .body)"
 
@@ -75,21 +74,22 @@ BR="agent/issue-${ISSUE}-$(date +%Y%m%d-%H%M%S)"
 git fetch origin --prune
 git checkout -B "$BR" "origin/$DEFAULT_BRANCH"
 
-# Prevent committing noise from this script or Poetry
-git restore --staged --worktree -- ops/agent.sh 2>/dev/null || true
-git checkout -- ops/agent.sh 2>/dev/null || true
-git update-index --assume-unchanged poetry.toml 2>/dev/null || true
+# Don't ever commit our own script or poetry.toml noise
+git update-index --assume-unchanged ops/agent.sh || true
+git update-index --assume-unchanged poetry.toml   || true
 
-# --- Prompt -------------------------------------------------------------------
+# --- Prompt --------------------------------------------------------------------
 export ISSUE_NUMBER="$ISSUE" ISSUE_TITLE ISSUE_BODY
 envsubst < ops/agent_prompt.tmpl > /tmp/agent_prompt.txt
 
-# Limit context to files mentioned in the issue body (if any)
+# Limit context to files mentioned in the issue body
 TARGET_FILES=()
 while IFS= read -r f; do
   [[ -f "$f" ]] && TARGET_FILES+=("$f")
 done < <(
-  printf '%s' "$ISSUE_BODY" | grep -Eo '([A-Za-z0-9._/-]+\.(scss|css|py|js|ts|html|jinja2|sh|yml|yaml))' | sort -u
+  printf '%s' "$ISSUE_BODY" |
+  grep -Eo '([A-Za-z0-9._/-]+\.(scss|css|py|js|ts|html|jinja2|sh|yml|yaml))' |
+  sort -u
 )
 
 AIDER_ARGS=(
@@ -97,7 +97,7 @@ AIDER_ARGS=(
   --no-gitignore
   --model "$MODEL"
   --edit-format udiff
-  --timeout 120                 # aider internal request timeout
+  --timeout 120
   --no-stream
   --disable-playwright
   --map-refresh files
@@ -119,24 +119,24 @@ run_aider() {
 # --- First pass ---------------------------------------------------------------
 run_aider
 
-# Exit if aider produced no diffs in the target files (or repo at all)
+# If the issue referenced files but none of them changed, bail out (even if other files changed)
 if [[ ${#TARGET_FILES[@]} -gt 0 ]]; then
   if git diff --quiet -- "${TARGET_FILES[@]}"; then
-    gh issue comment "$ISSUE" -R "$REPO" -b "Agent attempted patch but produced no changes to ${TARGET_FILES[*]}."
+    gh issue comment "$ISSUE" -R "$REPO" -b "Agent attempted patch but produced no changes to: ${TARGET_FILES[*]}."
     exit 0
   fi
 else
+  # No specific files referenced; if nothing changed at all, bail
   if git diff --quiet; then
     gh issue comment "$ISSUE" -R "$REPO" -b "Agent attempted patch but no changes were made."
     exit 0
   fi
 fi
 
-# --- Lint feedback loop (skip dockerized linters if not available) ------------
+# --- Lint feedback loop -------------------------------------------------------
 lint_once() {
   local log=/tmp/lint.log rc=0
 
-  # Docker-based lint?
   if [[ -S /var/run/docker.sock ]] && groups "$(whoami)" | grep -q docker; then
     if [[ -f Makefile ]] && grep -qE '^[[:space:]]*lint:' Makefile; then
       set +e; make lint > /dev/null 2> "$log"; rc=$?; set -e
@@ -144,7 +144,6 @@ lint_once() {
     fi
   fi
 
-  # Non-docker lint via npm if present
   if [[ -f package.json ]] && command -v jq >/dev/null && jq -e '.scripts.lint' package.json >/dev/null; then
     set +e
     npm ci --no-audit --prefer-offline >/dev/null 2>&1 || true
@@ -193,6 +192,10 @@ fi
 
 # --- Commit, push, PR ---------------------------------------------------------
 git add -A
+
+# Remove our script/poetry from the index if they slipped back in
+git restore --staged ops/agent.sh poetry.toml 2>/dev/null || true
+
 git commit -m "Agent patch for #${ISSUE} (${ISSUE_TITLE}) (tests rc=${RC})" || true
 git push -u origin "$BR"
 
