@@ -1,26 +1,26 @@
 name: run-agent
 
 on:
-  # Manual trigger
+  # Manual run from the Actions tab, with an issue number input
   workflow_dispatch:
     inputs:
       issue:
-        description: Issue number to work on
+        description: "Issue number to work on"
         required: true
-  # Auto-trigger when an issue is labeled "agent"
+        type: string
+  # Auto-run when a label is added to an issue
   issues:
     types: [labeled]
 
 jobs:
   agent:
-    # Don’t skip: allow manual OR labeled issues with label "agent"
-    if: >
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'issues' &&
-       github.event.action == 'labeled' &&
-       github.event.label.name == 'agent')
-
     runs-on: self-hosted
+
+    env:
+      # keep these names as-is (you already use them)
+      GH_TOKEN: ${{ secrets.AGENT_TOKEN }}
+      OLLAMA_API_BASE: http://127.0.0.1:11434
+      AIDER_MODEL: ollama:qwen2.5-coder:7b-instruct
 
     steps:
       - name: Checkout
@@ -32,21 +32,29 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "ISSUE_NUM=${{ github.event.inputs.issue }}" >> "$GITHUB_ENV"
+            ISSUE_NUM="${{ github.event.inputs.issue }}"
           else
-            echo "ISSUE_NUM=${{ github.event.issue.number }}" >> "$GITHUB_ENV"
+            # Only run when the "agent" label is added
+            if [[ "${{ github.event.action }}" != "labeled" || "${{ github.event.label.name }}" != "agent" ]]; then
+              echo "Not an 'agent' label event; skipping."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            ISSUE_NUM="${{ github.event.issue.number }}"
           fi
-          echo "Will work on issue #${ISSUE_NUM:-<unset>}"
+          # Export for later steps
+          echo "ISSUE_NUM=${ISSUE_NUM}" >> "$GITHUB_ENV"
+          # Also print it here so logs show the number in this step
+          echo "Will work on issue #${ISSUE_NUM}"
 
       - name: Run agent
+        if: steps.resolve.outputs.skip != 'true'
         shell: bash
-        env:
-          # keep the original token name you’re using
-          GH_TOKEN: ${{ secrets.AGENT_TOKEN }}
-          # native Ollama endpoint on the runner
-          OLLAMA_API_BASE: http://127.0.0.1:11434
-          # use the native Aider Ollama adapter name (avoids LiteLLM provider error)
-          AIDER_MODEL: ollama_chat/qwen2.5-coder:7b-instruct
         run: |
           set -euo pipefail
+          echo "Using ISSUE_NUM=$ISSUE_NUM"
           bash ops/agent.sh "$ISSUE_NUM"
+
+      - name: Post Checkout
+        if: always()
+        run: echo "Done."
