@@ -5,6 +5,12 @@ set -euo pipefail
 : "${GH_TOKEN:?GH_TOKEN is required}"
 export GITHUB_TOKEN="$GH_TOKEN"
 
+# Ensure Aider talks directly to your local Ollama server.
+unset LITELLM_PROVIDER LITELLM_OLLAMA_BASE OPENAI_API_KEY ANTHROPIC_API_KEY
+export OLLAMA_API_BASE="${OLLAMA_API_BASE:-http://127.0.0.1:11434}"
+export OLLAMA_HOST="${OLLAMA_HOST:-http://127.0.0.1:11434}"
+MODEL="${AIDER_MODEL:-ollama_chat/qwen2.5-coder:7b-instruct}"
+
 # Detect repo from git remote; fallback as requested
 REPO="${REPO:-$(git remote get-url origin 2>/dev/null | sed -n 's#.*github.com[:/]\(.*\.git\)#\1#p' | sed 's/\.git$//')}"
 REPO="${REPO:-titles-peeps/hushline}"
