@@ -1,3 +1,4 @@
+# .github/workflows/agent.yml
 name: agent
 
 on:
@@ -17,18 +18,14 @@ permissions:
 
 jobs:
   run-agent:
-    # Use your self-hosted runner; this also works on GH-hosted if you change to ubuntu-latest.
     runs-on: self-hosted
 
     env:
-      # Passed to ops/agent.sh
       GH_TOKEN: ${{ secrets.GH_TOKEN }}
       FLASK_ENV: test
       DATABASE_URL: sqlite:///./test.db
-      # Ollama defaults (harmless if not present)
       OLLAMA_API_BASE: http://127.0.0.1:11434
       OLLAMA_HOST: http://127.0.0.1:11434
-      # Python venv location inside workspace
       VENV: ${{ github.workspace }}/.venv
 
     steps:
@@ -37,25 +34,12 @@ jobs:
         with:
           fetch-depth: 0
 
-      # ----------------------------
-      # Deps: GitHub-hosted vs self-hosted
-      # ----------------------------
-      - name: Install system deps (GitHub-hosted only)
-        if: ${{ !contains(runner.labels, 'self-hosted') }}
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y jq curl
-
-      - name: Check deps (self-hosted)
-        if: ${{ contains(runner.labels, 'self-hosted') }}
+      - name: Sanity check deps (self-hosted)
         run: |
           for b in jq curl; do
             command -v "$b" >/dev/null || { echo "Missing $b on self-hosted runner"; exit 1; }
           done
 
-      # ----------------------------
-      # Python & Aider
-      # ----------------------------
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -66,16 +50,11 @@ jobs:
           python -m venv "$VENV"
           source "$VENV/bin/activate"
           pip install --upgrade pip
-          # Keep aider version explicit for reproducibility
           pip install "aider-chat==0.86.1" pytest
 
-      - name: Make agent.sh executable
-        run: |
-          chmod +x ops/agent.sh
+      - name: Make agent executable
+        run: chmod +x ops/agent.sh
 
-      # ----------------------------
-      # Determine issue number
-      # ----------------------------
       - name: Resolve issue number
         id: issue
         shell: bash
@@ -83,29 +62,18 @@ jobs:
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             echo "num=${{ inputs.issue }}" >> "$GITHUB_OUTPUT"
           else
-            # issues:labeled
             echo "num=${{ github.event.issue.number }}" >> "$GITHUB_OUTPUT"
           fi
-          echo "Resolved issue #$(cat $GITHUB_OUTPUT | sed -n 's/^num=//p')"
 
-      # ----------------------------
-      # Optional: warm up Ollama (self-hosted only)
-      # ----------------------------
-      - name: Warm up Ollama (self-hosted only)
-        if: ${{ contains(runner.labels, 'self-hosted') }}
-        shell: bash
+      - name: Warm up Ollama
         continue-on-error: true
         run: |
           set -e
           curl -fsS "$OLLAMA_API_BASE/api/tags" | jq -r '.models[].name' || true
-          # Pull coder model if not present (no-op if it exists)
           curl -fsS "$OLLAMA_API_BASE/api/pull" \
             -H 'Content-Type: application/json' \
             -d '{"model":"qwen2.5-coder:7b-instruct"}' || true
 
-      # ----------------------------
-      # Run the agent
-      # ----------------------------
       - name: Run agent
         env:
           PATH: ${{ env.VENV }}/bin:${{ env.PATH }}
