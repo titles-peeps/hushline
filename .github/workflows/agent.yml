@@ -1,55 +1,55 @@
-name: run-agent
+name: agent
 
 on:
   workflow_dispatch:
     inputs:
-      issue:
-        description: "Issue number to run against"
+      issue_number:
+        description: "Issue number to work on"
         required: false
   issues:
     types: [labeled]
 
 permissions:
-  contents: write
-  pull-requests: write
-  issues: write
+  contents: write        # push branches
+  pull-requests: write   # open/update PRs
+  issues: write          # comment on issues
+
+concurrency:
+  group: agent-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   agent:
     runs-on: self-hosted
+    timeout-minutes: 30
+    env:
+      # Map your secret to what the script expects
+      GH_TOKEN: ${{ secrets.AGENT_TOKEN }}
+      # LLM setup
+      OLLAMA_API_BASE: http://127.0.0.1:11434
+      AIDER_MODEL: ollama:qwen2.5-coder:7b-instruct
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Make agent script executable
-        run: |
-          sed -i 's/\r$//' ops/agent.sh
-          chmod +x ops/agent.sh
-
-      - name: Warm up Ollama (best-effort)
-        run: |
-          curl -s -X POST http://127.0.0.1:11434/api/pull \
-            -d '{"model":"qwen2.5-coder:7b-instruct"}' || true
-
-      - name: Resolve issue number
+      - name: Determine ISSUE_NUM
         id: issue
+        shell: bash
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "ISSUE_NUM=${{ github.event.inputs.issue }}" >> $GITHUB_ENV
-          else
-            echo "ISSUE_NUM=${{ github.event.issue.number }}" >> $GITHUB_ENV
+          set -euo pipefail
+          ISSUE_NUM=""
+          if [[ -n "${{ github.event.inputs.issue_number || '' }}" ]]; then
+            ISSUE_NUM="${{ github.event.inputs.issue_number }}"
+          elif [[ "${{ github.event_name }}" == "issues" && "${{ github.event.action }}" == "labeled" && "${{ github.event.label.name }}" == "agent" ]]; then
+            ISSUE_NUM="${{ github.event.issue.number }}"
           fi
+          if [[ -z "${ISSUE_NUM}" ]]; then
+            echo "No issue number provided (neither workflow_dispatch input nor 'agent' label on an issue event)." >&2
+            exit 1
+          fi
+          echo "ISSUE_NUM=${ISSUE_NUM}" >> "$GITHUB_ENV"
 
       - name: Run agent
+        shell: bash
         run: bash ops/agent.sh "$ISSUE_NUM"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          OLLAMA_API_BASE: http://127.0.0.1:11434
-          LITELLM_PROVIDER: ollama
-          LITELLM_OLLAMA_BASE: http://127.0.0.1:11434
