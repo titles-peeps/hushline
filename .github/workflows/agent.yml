@@ -3,53 +3,38 @@ name: agent
 on:
   workflow_dispatch:
     inputs:
-      issue_number:
+      issue:
         description: "Issue number to work on"
-        required: false
+        required: true
   issues:
     types: [labeled]
 
 permissions:
-  contents: write        # push branches
-  pull-requests: write   # open/update PRs
-  issues: write          # comment on issues
-
-concurrency:
-  group: agent-${{ github.ref }}
-  cancel-in-progress: false
+  contents: write
+  pull-requests: write
+  issues: write
 
 jobs:
-  agent:
+  run-agent:
     runs-on: self-hosted
-    timeout-minutes: 30
-    env:
-      # Map your secret to what the script expects
-      GH_TOKEN: ${{ secrets.AGENT_TOKEN }}
-      # LLM setup
-      OLLAMA_API_BASE: http://127.0.0.1:11434
-      AIDER_MODEL: ollama:qwen2.5-coder:7b-instruct
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Determine ISSUE_NUM
-        id: issue
-        shell: bash
+      - name: Resolve issue number
+        id: iss
         run: |
-          set -euo pipefail
-          ISSUE_NUM=""
-          if [[ -n "${{ github.event.inputs.issue_number || '' }}" ]]; then
-            ISSUE_NUM="${{ github.event.inputs.issue_number }}"
-          elif [[ "${{ github.event_name }}" == "issues" && "${{ github.event.action }}" == "labeled" && "${{ github.event.label.name }}" == "agent" ]]; then
-            ISSUE_NUM="${{ github.event.issue.number }}"
+          if [[ -n "${{ github.event.inputs.issue }}" ]]; then
+            echo "num=${{ github.event.inputs.issue }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "num=${{ github.event.issue.number }}" >> "$GITHUB_OUTPUT"
           fi
-          if [[ -z "${ISSUE_NUM}" ]]; then
-            echo "No issue number provided (neither workflow_dispatch input nor 'agent' label on an issue event)." >&2
-            exit 1
-          fi
-          echo "ISSUE_NUM=${ISSUE_NUM}" >> "$GITHUB_ENV"
 
       - name: Run agent
-        shell: bash
-        run: bash ops/agent.sh "$ISSUE_NUM"
+        env:
+          GH_TOKEN: ${{ secrets.AGENT_TOKEN }}
+          OLLAMA_API_BASE: http://127.0.0.1:11434
+          AIDER_MODEL: ollama_chat/qwen2.5-coder:7b-instruct
+        run: |
+          bash ops/agent.sh "${{ steps.iss.outputs.num }}"

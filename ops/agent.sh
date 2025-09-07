@@ -7,92 +7,114 @@ if [[ $# -ne 1 ]]; then
   exit 2
 fi
 
-ISSUE="$1"
-
-# --- config (minimal) ---
-REPO="${REPO:-$(git remote get-url origin 2>/dev/null | sed -nE 's#.*/([^/]+/[^/.]+)(\.git)?$#\1#p')}"
-REPO="${REPO:-titles-peeps/hushline}"
-
-# Required: GH_TOKEN must be provided by workflow secrets
 : "${GH_TOKEN:?GH_TOKEN is required}"
 export GITHUB_TOKEN="$GH_TOKEN"
 
-# Aider+Ollama
+ISSUE="$1"
+
+# Prefer repo from git remote; fallback to titles-peeps/hushline
+REPO="${REPO:-$(git remote get-url origin 2>/dev/null | sed -nE 's#.*github.com[:/]+([^/]+/[^/.]+)(\.git)?$#\1#p')}"
+REPO="${REPO:-titles-peeps/hushline}"
+
+# Model/endpoint (native Ollama path; avoids LiteLLM)
 export OLLAMA_API_BASE="${OLLAMA_API_BASE:-http://127.0.0.1:11434}"
-AIDER_MODEL="${AIDER_MODEL:-ollama_chat/qwen2.5-coder:7b-instruct}"
+MODEL="${AIDER_MODEL:-ollama_chat/qwen2.5-coder:7b-instruct}"
 
-# Make Aider as gentle as possible
-AIDER_ARGS=(
-  --yes
-  --no-gitignore
-  --model "$AIDER_MODEL"
-  --edit-format udiff
-  --timeout 60
-  --no-stream
-  --map-refresh files
-  --map-multiplier-no-files 0
-  --map-tokens 256
-  --max-chat-history-tokens 512
-  --disable-playwright
-)
+# Basic deps
+for b in gh git aider; do
+  command -v "$b" >/dev/null || { echo "Missing dependency: $b" >&2; exit 1; }
+done
 
-# --- ensure we’re in a repo root ---
-[[ -d .git ]] || { echo "run from repo root"; exit 1; }
-[[ -f ops/agent_prompt.tmpl ]] || { echo "missing ops/agent_prompt.tmpl"; exit 1; }
+# Ensure repo root and prompt template
+[[ -d .git ]] || { echo "Run from repo root"; exit 1; }
+[[ -f ops/agent_prompt.tmpl ]] || {
+  cat > ops/agent_prompt.tmpl <<'TPL'
+You are the Hush Line code assistant. Work only in this repository.
 
-# --- light Ollama warmup (don’t hang if down) ---
-curl -fsS "$OLLAMA_API_BASE/api/tags" >/dev/null || true
+Issue #: ${ISSUE_NUMBER}
+Title: ${ISSUE_TITLE}
 
-# --- fetch issue data (preserve newlines) ---
+Task:
+- If change is backend/auth/CSP/crypto-critical:
+  * Add minimal pytest tests and implement the smallest fix.
+- If change is styles/markup/static-only:
+  * Implement directly (no tests required).
+- Preserve public APIs and security posture (CSP, TOTP, Tor, crypto).
+- Follow repo conventions (pytest, Black/isort). No new services/env vars.
+
+Output rules:
+- Return unified diffs only (no prose).
+
+Context (issue body follows):
+${ISSUE_BODY}
+TPL
+}
+
+# Fetch issue details
 ISSUE_TITLE="$(gh issue view "$ISSUE" -R "$REPO" --json title -q .title)"
 ISSUE_BODY="$(gh issue view "$ISSUE" -R "$REPO" --json body  -q .body)"
 
-# --- base branch & working branch ---
+# Default branch
 DEFAULT_BRANCH="$(gh repo view "$REPO" --json defaultBranchRef -q .defaultBranchRef.name 2>/dev/null || true)"
 DEFAULT_BRANCH="${DEFAULT_BRANCH:-$(git remote show origin 2>/dev/null | sed -n 's/.*HEAD branch: //p')}"
 DEFAULT_BRANCH="${DEFAULT_BRANCH:-main}"
 
-BR="agent/issue-${ISSUE}-$(date +%Y%m%d-%H%M%S)"
+# Create work branch
 git fetch origin --prune
-git checkout -B "$BR" "origin/$DEFAULT_BRANCH"
+BR="agent/issue-${ISSUE}-$(date +%Y%m%d-%H%M%S)"
+git checkout -B "$BR" "origin/${DEFAULT_BRANCH}"
 
-# --- build prompt for the LLM ---
+# Build prompt
 export ISSUE_NUMBER="$ISSUE" ISSUE_TITLE ISSUE_BODY
 envsubst < ops/agent_prompt.tmpl > /tmp/agent_prompt.txt
 
-# If the issue mentions paths, pass those files to Aider (keeps repo-map small)
+# Try to extract explicit file paths from the issue body (generic)
 TARGET_FILES=()
 while IFS= read -r f; do
   [[ -f "$f" ]] && TARGET_FILES+=("$f")
-done < <(printf '%s\n' "$ISSUE_BODY" | grep -Eo '([A-Za-z0-9._/-]+\.(py|js|ts|tsx|jsx|css|scss|sass|html|jinja2|yml|yaml|toml|json|md|sh))' | sort -u)
+done < <(echo "$ISSUE_BODY" | grep -Eo '([A-Za-z0-9._/-]+\.(py|js|ts|jsx|tsx|css|scss|sass|html|jinja2|sh|yml|yaml|toml|json))' | sort -u)
 
-# --- run LLM edit once (LLM is the only mechanism; no fallbacks) ---
+# Aider args (kept small & simple)
+AIDER_ARGS=(
+  --yes
+  --no-gitignore
+  --model "$MODEL"
+  --edit-format udiff
+  --timeout 90
+  --no-stream
+  --map-refresh files
+  --map-multiplier-no-files 0
+  --map-tokens 512
+  --max-chat-history-tokens 1024
+)
+
+# Run aider (with target files when we have them)
 if [[ ${#TARGET_FILES[@]} -gt 0 ]]; then
-  timeout -k 5 180 aider "${AIDER_ARGS[@]}" --message "$(cat /tmp/agent_prompt.txt)" "${TARGET_FILES[@]}" || true
+  aider "${AIDER_ARGS[@]}" --message "$(cat /tmp/agent_prompt.txt)" "${TARGET_FILES[@]}" || true
 else
-  timeout -k 5 180 aider "${AIDER_ARGS[@]}" --message "$(cat /tmp/agent_prompt.txt)" || true
+  aider "${AIDER_ARGS[@]}" --message "$(cat /tmp/agent_prompt.txt)" || true
 fi
 
-# --- if nothing changed, post a comment and exit ---
+# If no changes, say so and exit cleanly
 if git diff --quiet && git diff --cached --quiet; then
-  gh issue comment "$ISSUE" -R "$REPO" -b "Agent ran the LLM but produced no changes."
+  gh issue comment "$ISSUE" -R "$REPO" -b "Agent attempted patch but produced no changes."
   exit 0
 fi
 
-# --- commit/push/PR (no tests/linters here) ---
+# Commit & push
 git add -A
-git -c user.name="hushline-agent" -c user.email="agent@users.noreply.github.com" \
-  commit -m "Agent patch for #${ISSUE}: ${ISSUE_TITLE}"
-
+git commit -m "Agent patch for #${ISSUE}: ${ISSUE_TITLE}" || true
 git push -u origin "$BR"
 
+# Create PR
 EXISTING_PR="$(gh pr list -R "$REPO" --head "$BR" --json number -q '.[0].number')"
 if [[ -z "$EXISTING_PR" ]]; then
   gh pr create -R "$REPO" \
     -t "Agent patch for #${ISSUE}: ${ISSUE_TITLE}" \
     -b "Automated patch for #${ISSUE}."
 else
-  gh pr comment -R "$REPO" "$EXISTING_PR" -b "Agent updated the patch."
+  gh pr comment -R "$REPO" "$EXISTING_PR" -b "Updated patch."
 fi
 
+# Link PR on the issue
 gh issue comment "$ISSUE" -R "$REPO" -b "Agent created/updated PR from branch \`$BR\`."
