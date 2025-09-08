@@ -8,6 +8,10 @@ export GITHUB_TOKEN="$GH_TOKEN"
 # Explicit Ollama + LiteLLM wiring so Aider never guesses
 export OLLAMA_API_BASE="${OLLAMA_API_BASE:-http://127.0.0.1:11434}"
 export LITELLM_PROVIDER="${LITELLM_PROVIDER:-ollama}"
+export OLLAMA_NUM_GPU_LAYERS=8
+export OLLAMA_NUM_CTX=1024
+export OLLAMA_NUM_BATCH=16
+export OLLAMA_NUM_THREAD=4
 
 # Model naming Aider/LiteLLM expects for POST /api/chat
 MODEL="${AIDER_MODEL:-ollama_chat/qwen2.5-coder:7b-instruct}"
