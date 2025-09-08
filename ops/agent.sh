@@ -9,7 +9,8 @@ export GITHUB_TOKEN="$GH_TOKEN"
 REPO="${REPO:-$(git remote get-url origin 2>/dev/null | sed -n 's#.*github.com[:/]\(.*\.git\)#\1#p' | sed 's/\.git$//')}"
 REPO="${REPO:-titles-peeps/hushline}"
 
-MODEL="${AIDER_MODEL:-ollama:qwen2.5-coder:7b-instruct}"
+# IMPORTANT: model must be provider/model (slash), not provider:model
+MODEL="${AIDER_MODEL:-ollama_chat/qwen2.5-coder:7b-instruct}"
 ISSUE_NUM="${1:?usage: ops/agent.sh <issue_number>}"
 
 # Ensure tools

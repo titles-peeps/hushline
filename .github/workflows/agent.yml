@@ -1,14 +1,12 @@
 name: run-agent
 
 on:
-  # Manual run from the Actions tab, with an issue number input
   workflow_dispatch:
     inputs:
       issue:
         description: "Issue number to work on"
         required: true
         type: string
-  # Auto-run when a label is added to an issue
   issues:
     types: [labeled]
 
@@ -17,10 +15,12 @@ jobs:
     runs-on: self-hosted
 
     env:
-      # keep these names as-is (you already use them)
       GH_TOKEN: ${{ secrets.AGENT_TOKEN }}
       OLLAMA_API_BASE: http://127.0.0.1:11434
-      AIDER_MODEL: ollama:qwen2.5-coder:7b-instruct
+      # ✓ Use LiteLLM's provider/model syntax (SLASH, not colon)
+      AIDER_MODEL: ollama_chat/qwen2.5-coder:7b-instruct
+      # (Optional but harmless; keeps LiteLLM happy)
+      LITELLM_PROVIDER: ollama
 
     steps:
       - name: Checkout
@@ -34,7 +34,6 @@ jobs:
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             ISSUE_NUM="${{ github.event.inputs.issue }}"
           else
-            # Only run when the "agent" label is added
             if [[ "${{ github.event.action }}" != "labeled" || "${{ github.event.label.name }}" != "agent" ]]; then
               echo "Not an 'agent' label event; skipping."
               echo "skip=true" >> "$GITHUB_OUTPUT"
@@ -42,9 +41,7 @@ jobs:
             fi
             ISSUE_NUM="${{ github.event.issue.number }}"
           fi
-          # Export for later steps
           echo "ISSUE_NUM=${ISSUE_NUM}" >> "$GITHUB_ENV"
-          # Also print it here so logs show the number in this step
           echo "Will work on issue #${ISSUE_NUM}"
 
       - name: Run agent
