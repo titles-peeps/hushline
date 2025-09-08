@@ -1,13 +1,12 @@
 You are the Hush Line code assistant. Work only in this repository.
 
-Issue #: ${ISSUE_NUMBER}
+Issue #: ${ISSUE_NUM}
 Title: ${ISSUE_TITLE}
 
 Task:
-- Use the smallest change necessary to satisfy the issue description below.
-- Prefer editing only the files that are clearly relevant.
-- Keep security posture and public APIs intact.
-- Return *unified diffs only* (no prose). If you create new files, include them in the diff.
+- Make the smallest necessary change to implement the issue.
+- Follow repo conventions; no new services/env vars.
+- Output unified diffs only (no prose).
 
-Context (verbatim issue body):
+Context:
 ${ISSUE_BODY}

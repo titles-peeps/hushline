@@ -1,57 +1,54 @@
-name: run-agent
+name: agent
 
 on:
+  issues:
+    types: [labeled]
   workflow_dispatch:
     inputs:
       issue:
         description: "Issue number to work on"
         required: true
-        type: string
-  issues:
-    types: [labeled]
 
 jobs:
-  agent:
+  run-agent:
+    if: >
+      (github.event_name == 'issues' && contains(github.event.label.name, 'agent'))
+      || (github.event_name == 'workflow_dispatch')
     runs-on: self-hosted
 
     env:
+      # --- required envs (names unchanged) ---
       GH_TOKEN: ${{ secrets.AGENT_TOKEN }}
+      # Point Aider/LiteLLM at your local Ollama
       OLLAMA_API_BASE: http://127.0.0.1:11434
-      # ✓ Use LiteLLM's provider/model syntax (SLASH, not colon)
-      AIDER_MODEL: ollama_chat/qwen2.5-coder:7b-instruct
-      # (Optional but harmless; keeps LiteLLM happy)
+      # Force provider detection (belt & suspenders)
       LITELLM_PROVIDER: ollama
+      # Use chat endpoint, with explicit provider prefix Aider expects
+      AIDER_MODEL: ollama_chat/qwen2.5-coder:7b-instruct
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Resolve issue number
-        id: resolve
+      - name: Show issue being processed
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            ISSUE_NUM="${{ github.event.inputs.issue }}"
+          if [ "${{ github.event_name }}" = "issues" ]; then
+            echo "Will work on issue #${{ github.event.issue.number }}"
+            echo "ISSUE_NUM=${{ github.event.issue.number }}" >> "$GITHUB_ENV"
           else
-            if [[ "${{ github.event.action }}" != "labeled" || "${{ github.event.label.name }}" != "agent" ]]; then
-              echo "Not an 'agent' label event; skipping."
-              echo "skip=true" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-            ISSUE_NUM="${{ github.event.issue.number }}"
+            echo "Will work on issue #${{ inputs.issue }}"
+            echo "ISSUE_NUM=${{ inputs.issue }}" >> "$GITHUB_ENV"
           fi
-          echo "ISSUE_NUM=${ISSUE_NUM}" >> "$GITHUB_ENV"
-          echo "Will work on issue #${ISSUE_NUM}"
 
       - name: Run agent
-        if: steps.resolve.outputs.skip != 'true'
         shell: bash
         run: |
           set -euo pipefail
-          echo "Using ISSUE_NUM=$ISSUE_NUM"
-          bash ops/agent.sh "$ISSUE_NUM"
-
-      - name: Post Checkout
-        if: always()
-        run: echo "Done."
+          # Keep the machine stable
+          ulimit -n 4096 || true
+          ulimit -v 2097152 || true   # 2GB virtual mem cap (adjust if needed)
+          ionice -c2 -n7 -- bash ops/agent.sh "${ISSUE_NUM}"
