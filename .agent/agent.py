@@ -200,8 +200,20 @@ def parse_changed_files_from_diff(diff_text: str) -> List[str]:
 
 def apply_diff(diff_text: str) -> None:
     tmp = STATE_DIR / "change.diff"
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+    # validate diff header
+    if not diff_text.lstrip().startswith(("--- a/", "diff --git")):
+        raise RuntimeError("LLM did not return a unified diff")
     tmp.write_text(diff_text, encoding="utf-8")
-    run(["git", "apply", "--index", "--whitespace=fix", str(tmp)])
+    # try fast apply first
+    try:
+        run(["git", "apply", "--index", "--whitespace=fix", str(tmp)])
+        return
+    except Exception:
+        pass
+    # 3-way with rejects as fallback
+    run(["git", "apply", "--index", "--reject", "--3way", "--whitespace=nowarn", str(tmp)])
+
 
 def run_checks() -> str:
     logs = []
