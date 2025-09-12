@@ -1,51 +1,86 @@
 #!/bin/bash
 set -euo pipefail
-: "${GITHUB_EVENT_PATH:?missing}"
-: "${AGENT_TOKEN:?missing}"
+
+# Inputs from GitHub Actions
+: "${GITHUB_EVENT_PATH:?missing GITHUB_EVENT_PATH}"
+: "${AGENT_TOKEN:?missing AGENT_TOKEN}"
+: "${GITHUB_REPOSITORY:?missing GITHUB_REPOSITORY}"   # e.g. scidsg/hushline
+GITHUB_API_URL_DEFAULT="https://api.github.com"
+GITHUB_API="${GITHUB_API_URL:-$GITHUB_API_URL_DEFAULT}"
+
 ISSUE_NUMBER="$(jq -r .issue.number "$GITHUB_EVENT_PATH")"
 ISSUE_TITLE="$(jq -r .issue.title "$GITHUB_EVENT_PATH")"
 ISSUE_BODY="$(jq -r .issue.body  "$GITHUB_EVENT_PATH")"
-echo "Agent(MVP) for issue #${ISSUE_NUMBER}: ${ISSUE_TITLE}"
-BODY_PAYLOAD="$(printf '%s' "$ISSUE_BODY" | awk '/^<<<BEGIN_PATCH$/{ib=1;next}/^END_PATCH>>>$/{if(ib){exit 0}}{if(ib)print}END{if(ib)exit 0;else exit 1}' 2>/dev/null || true)"
-if [[ -z "$BODY_PAYLOAD" ]]; then
-  BODY_PAYLOAD="$(printf '%s' "$ISSUE_BODY" | awk 'BEGIN{f=0}/^```/{if(f==0){f=1;next}else if(f==1){f=2;exit}}{if(f==1)print}' 2>/dev/null || true)"
+
+echo "Agent for issue #${ISSUE_NUMBER}: ${ISSUE_TITLE}"
+
+# Build prompt from YAML
+SYSTEM_PROMPT=""
+USER_TEMPLATE=""
+section=""
+while IFS= read -r line || [[ -n "$line" ]]; do
+  if [[ "$line" =~ ^system: ]]; then section="system"; continue
+  elif [[ "$line" =~ ^user: ]]; then section="user"; continue; fi
+  trimmed="${line#  }"
+  if [[ "$section" == "system" ]]; then SYSTEM_PROMPT+="${trimmed}"$'\n'
+  elif [[ "$section" == "user"   ]]; then USER_TEMPLATE+="${trimmed}"$'\n'
+  fi
+done < ops/agent_prompt.yml
+
+USER_PROMPT="${USER_TEMPLATE//\$ISSUE_TITLE/$ISSUE_TITLE}"
+USER_PROMPT="${USER_PROMPT//\$ISSUE_BODY/$ISSUE_BODY}"
+
+MODEL_NAME="qwen2.5-coder:7b-instruct"
+
+# Ensure Ollama is up; if not, post a diagnostic comment and exit 0 (no failure)
+if ! curl -fsS http://127.0.0.1:11434/api/tags >/dev/null; then
+  DIAG="Local Ollama API is not reachable on 127.0.0.1:11434."
+  echo "$DIAG"
+  curl -fsS -X POST \
+    -H "Authorization: token ${AGENT_TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d "$(jq -n --arg body ":warning: Agent could not run locally.\n\n$DIAG" '{body:$body}')" \
+    "${GITHUB_API}/repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" >/dev/null || true
+  exit 0
 fi
-if [[ -z "$BODY_PAYLOAD" ]]; then BODY_PAYLOAD="$ISSUE_BODY"; fi
-DIFF_OUT="$(python3 - "$BODY_PAYLOAD" <<'PY' || true
-import os, sys, re, subprocess
-payload = sys.argv[1].replace('\r\n','\n').replace('\r','\n')
-pat = re.compile(r'^FILE:\s+([^\n]+)\n-----BEGIN FILE-----\n(.*?)\n-----END FILE-----\n?', re.S|re.M)
-blocks = pat.findall(payload)
-if not blocks: sys.exit(10)
-changed=set()
-for path, content in blocks:
-    p=path.strip()
-    if not p or p.startswith('/') or '..' in p.split('/'): sys.exit(11)
-    d=os.path.dirname(p)
-    if d and not os.path.isdir(d): os.makedirs(d, exist_ok=True)
-    with open(p,'wb') as f: f.write(content.encode('utf-8','surrogatepass'))
-    changed.add(p)
-for p in sorted(changed): subprocess.run(["git","add","-N","--",p], check=False)
-diff = subprocess.run(["git","diff"], capture_output=True, text=True).stdout
-if not diff.strip(): sys.exit(12)
-sys.stdout.write(diff)
-PY
-)"
-if [[ -z "$DIFF_OUT" ]]; then echo "No actionable FILE blocks; skipping."; exit 0; fi
-printf '%s' "$DIFF_OUT" > patch.diff
-git apply --check patch.diff 2>/dev/null || true
-git apply patch.diff 2>/dev/null || true
-BRANCH_NAME="agent-issue-${ISSUE_NUMBER}"
-git config user.name "Hushline Agent Bot"
-git config user.email "titles-peeps@users.noreply.github.com"
-git checkout -b "$BRANCH_NAME" 2>/dev/null || git checkout "$BRANCH_NAME"
-git add -A
-if git diff --cached --quiet; then echo "Nothing to commit."; exit 0; fi
-git commit -m "Fix(#${ISSUE_NUMBER}): ${ISSUE_TITLE}"
-git push "https://x-access-token:${AGENT_TOKEN}@github.com/titles-peeps/hushline.git" "$BRANCH_NAME"
-PR_TITLE="Fix: ${ISSUE_TITLE}"
-PR_BODY="Closes #${ISSUE_NUMBER} (automated MVP agent)."
-API_JSON=$(printf '%s' "{\"head\":\"titles-peeps:${BRANCH_NAME}\",\"base\":\"main\",\"title\":\"${PR_TITLE//\"/\\\"}\",\"body\":\"${PR_BODY//\"/\\\"}\"}")
-RES=$(curl -s -X POST -H "Authorization: token ${AGENT_TOKEN}" -H "Content-Type: application/json" -d "${API_JSON}" "https://api.github.com/repos/scidsg/hushline/pulls")
-URL=$(echo "$RES" | jq -r .html_url 2>/dev/null || echo "")
-[[ -n "$URL" && "$URL" != "null" ]] && echo "PR: $URL" || { echo "$RES"; exit 1; }
+
+# Make sure model is present (non-fatal if already pulled)
+ollama pull "$MODEL_NAME" || true
+
+# Call Ollama chat API (no special formatting expected)
+REQUEST_JSON=$(jq -n \
+  --arg model "$MODEL_NAME" \
+  --arg sys "$SYSTEM_PROMPT" \
+  --arg usr "$USER_PROMPT" \
+  --argjson opts '{"temperature":0.2,"num_ctx":8192}' \
+  '{model:$model,stream:false,options:$opts,
+    messages:[{role:"system",content:$sys},{role:"user",content:$usr}]}' )
+
+RAW_RESPONSE="$(curl -fsS -X POST http://127.0.0.1:11434/api/chat \
+  -H 'Content-Type: application/json' \
+  -d "$REQUEST_JSON" \
+  | jq -r '.message.content // .response // ""')"
+
+# Sanitize to printable text; if empty, note that explicitly
+RESPONSE_CLEAN="$(printf '%s' "$RAW_RESPONSE" | tr -cd '\11\12\15\40-\176')"
+if [[ -z "$RESPONSE_CLEAN" ]]; then
+  RESPONSE_CLEAN="(Agent produced no textual output.)"
+fi
+
+# Post the agent’s response as an issue comment
+COMMENT_BODY=$(
+  jq -n --arg out "$RESPONSE_CLEAN" --arg model "$MODEL_NAME" --arg title "$ISSUE_TITLE" '
+    { body:
+        ("### Agent response\n\n" +
+         "**Model:** " + $model + "\n\n" +
+         $out)
+    }'
+)
+
+curl -fsS -X POST \
+  -H "Authorization: token ${AGENT_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d "$COMMENT_BODY" \
+  "${GITHUB_API}/repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" >/dev/null
+
+echo "Comment posted."
