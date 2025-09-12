@@ -63,6 +63,7 @@ def load_yaml(path: pathlib.Path) -> dict:
         return yaml.safe_load(f)
 
 def save_json(path: pathlib.Path, obj: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     with tmp.open("w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, sort_keys=True)
@@ -200,6 +201,7 @@ def parse_changed_files_from_diff(diff_text: str) -> List[str]:
 
 def apply_diff(diff_text: str) -> None:
     tmp = STATE_DIR / "change.diff"
+    tmp.parent.mkdir(parents=True, exist_ok=True)
     tmp.write_text(diff_text, encoding="utf-8")
     run(["git", "apply", "--index", "--whitespace=fix", str(tmp)])
 
@@ -242,7 +244,12 @@ def get_issue(owner: str, repo: str, token: str, number: int) -> dict:
     return http_get(url, token)
 
 def create_branch(branch: str, base="main"):
-    run(f"git checkout -b {branch} {base}")
+    try:
+        run(f"git rev-parse --verify {branch}")
+        run(f"git checkout {branch}")
+        run(f"git reset --hard {base}")
+    except Exception:
+        run(f"git checkout -B {branch} {base}")
 
 def commit_all(message: str):
     run("git add -A")
