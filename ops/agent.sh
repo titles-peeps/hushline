@@ -37,19 +37,23 @@ FINAL_PROMPT="${SYSTEM_PROMPT}
 ${USER_PROMPT}"
 
 MODEL_NAME="qwen2.5-coder:7b-instruct"
-echo "Pulling LLM model ($MODEL_NAME) if not already present..."
+
+# Ensure Ollama daemon is responding
+curl -fsS http://127.0.0.1:11434/api/tags >/dev/null || {
+  echo "Ollama API not responding on 127.0.0.1:11434"; exit 1;
+}
+
+# Make sure model is present
 ollama pull "$MODEL_NAME" || true
 
-echo "Running LLM to generate output..."
-# Force non-interactive, non-TTY behavior; strip all control chars/ANSI from stdout.
-# Keep stderr separately for debug.
-export TERM=dumb
-export OLLAMA_NO_TTY=1
-echo -e "$FINAL_PROMPT" \
-  | ollama run "$MODEL_NAME" 2>model.stderr \
-  | tr -cd '\11\12\15\40-\176' \
-  > model.out
+# Call Ollama HTTP API with stream:false to get clean JSON
+PROMPT_JSON="$(printf '%s' "$FINAL_PROMPT" | jq -Rs .)"
+curl -fsS -X POST http://127.0.0.1:11434/api/generate \
+  -H 'Content-Type: application/json' \
+  -d "{\"model\":\"$MODEL_NAME\",\"prompt\":$PROMPT_JSON,\"stream\":false,\"options\":{\"temperature\":0,\"num_ctx\":8192}}" \
+  | jq -r '.response' > model.out
 
+# Extract diff or FILE blocks
 extract_unified_diff() {
   if grep -q '^```diff' model.out; then
     awk '/^```diff/{f=1;next} /^```$/{f=0} f' model.out > patch.body || true
@@ -62,19 +66,13 @@ extract_unified_diff() {
 
 apply_unified_diff() {
   if git apply --check patch.diff 2>/dev/null; then
-    git apply patch.diff
-    echo "Patch applied."
-    return 0
+    git apply patch.diff; echo "Patch applied."; return 0
   fi
   if git apply --check --whitespace=fix patch.diff 2>/dev/null; then
-    git apply --whitespace=fix patch.diff
-    echo "Patch applied with whitespace fix."
-    return 0
+    git apply --whitespace=fix patch.diff; echo "Patch applied with whitespace fix."; return 0
   fi
   if git apply --check --3way patch.diff 2>/dev/null; then
-    git apply --3way patch.diff
-    echo "Patch applied with 3-way merge."
-    return 0
+    git apply --3way patch.diff; echo "Patch applied with 3-way merge."; return 0
   fi
   return 1
 }
@@ -125,29 +123,16 @@ if grep -qx 'NO_CHANGES' model.out; then
 fi
 
 if extract_unified_diff; then
-  if apply_unified_diff; then
-    MODE="diff"
-  else
-    echo "git apply failed for unified diff"
-    exit 1
-  fi
+  if apply_unified_diff; then MODE="diff"; else echo "git apply failed for unified diff"; exit 1; fi
 else
-  if apply_file_blocks; then
-    MODE="files"
-    echo "Applied FILE blocks and built working-tree diff."
-  else
-    echo "Model output not usable (neither valid diff nor valid FILE blocks). First lines:"
-    sed -n '1,80p' model.out
-    echo "--- stderr ---"
-    sed -n '1,80p' model.stderr
-    exit 1
-  fi
+  if apply_file_blocks; then MODE="files"; echo "Applied FILE blocks and built working-tree diff."
+  else echo "Model output not usable (neither valid diff nor valid FILE blocks). First lines:"; sed -n '1,80p' model.out; exit 1; fi
 fi
 
 export PATH="$HOME/.local/bin:$PATH"
 python3 -m pip install --user --no-cache-dir black isort >/dev/null 2>&1 || true
 command -v isort >/dev/null 2>&1 && isort . || true
-command -v black >/dev/null 2>&1 && black . || true
+command -v black  >/dev/null 2>&1 && black .  || true
 
 BRANCH_NAME="agent-issue-${ISSUE_NUMBER}"
 git config user.name "Hushline Agent Bot"
