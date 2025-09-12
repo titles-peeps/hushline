@@ -11,6 +11,9 @@ jobs:
       contents: write
       issues: write
       pull-requests: write
+    env:
+      OLLAMA_NO_TTY: "1"
+      TERM: dumb
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -43,9 +46,6 @@ jobs:
           ollama list || true
 
       - name: Run agent
-        env:
-          OLLAMA_NO_TTY: '1'
-          TERM: 'dumb'
         env:
           AGENT_TOKEN: ${{ secrets.AGENT_TOKEN }}
         run: |
