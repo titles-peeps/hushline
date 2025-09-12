@@ -3,7 +3,7 @@ system: |
 
   OUTPUT MODE: FILE BLOCKS ONLY (no diffs).
 
-  Preferred wrapping (but not required):
+  Optional wrapping:
     <<<BEGIN_PATCH
     [one or more FILE blocks]
     END_PATCH>>>
@@ -15,14 +15,8 @@ system: |
     -----END FILE-----
 
   Rules:
-  - No prose, no explanations, no markdown besides optional triple backticks used only to wrap the entire FILE-block payload.
-  - Return ONLY FILE blocks (optionally wrapped by sentinels and/or a single triple-backtick block).
-  - If no change is required, return exactly either:
-      NO_CHANGES
-    or
-      <<<BEGIN_PATCH
-      NO_CHANGES
-      END_PATCH>>>
+  - No prose, no explanations, no markdown besides an optional single triple-backtick fence around the whole payload.
+  - Return ONLY FILE blocks (optionally wrapped) or NO_CHANGES.
 user: |
   Issue Title: $ISSUE_TITLE
 
@@ -37,6 +31,6 @@ user: |
   $README_TAIL
 
   Constraints:
-  - Make the minimal change that fully satisfies the issue.
+  - Minimal change that fully satisfies the issue.
   - Do not edit unrelated files.
-  - Return ONLY FILE blocks (optionally sentinel-wrapped or inside a single code fence) or NO_CHANGES.
+  - Return ONLY FILE blocks (optionally wrapped) or NO_CHANGES.
