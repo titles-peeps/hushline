@@ -1,0 +1,13 @@
+# Hush Line local autonomous agent config
+repo_owner: "titles-peeps"
+repo_name: "hushline"
+default_branch: "main"
+
+# Ollama model and options
+model: "qwen2.5-coder:7b"
+ollama_options:
+  temperature: 0.1
+  num_ctx: 4096
+
+# Polling cadence in seconds
+poll_seconds: 60

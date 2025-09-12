@@ -1,0 +1,22 @@
+[Unit]
+Description=Hush Line Local Coding Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/hushline           # set to the cloned repo path
+EnvironmentFile=/etc/hushline-agent.env  # contains AGENT_TOKEN and optional OLLAMA_URL
+ExecStart=/usr/bin/env python3 .agent/agent.py
+Restart=always
+RestartSec=5
+User=hushline
+Group=hushline
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

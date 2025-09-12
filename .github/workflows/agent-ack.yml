@@ -1,0 +1,23 @@
+name: agent-ack
+on:
+  issues:
+    types: [labeled]
+permissions:
+  issues: write
+  contents: read
+jobs:
+  ack:
+    if: contains(github.event.label.name, 'agent')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Comment that the agent is queued
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue_number = context.payload.issue.number;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number,
+              body: "Agent: queued."
+            });
