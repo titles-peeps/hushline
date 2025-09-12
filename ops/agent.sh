@@ -6,7 +6,6 @@ ISSUE_TITLE="$(jq -r .issue.title "$GITHUB_EVENT_PATH")"
 ISSUE_BODY="$(jq -r .issue.body  "$GITHUB_EVENT_PATH")"
 echo "Agent triggered for issue #${ISSUE_NUMBER}: ${ISSUE_TITLE}"
 
-# Repo context for prompt
 REPO_FILES="$(git ls-files | sed -e 's/^/  - /')"
 if [[ -f README.md ]]; then
   README_TAIL="$(tail -n 20 README.md | sed -e 's/^/    /')"
@@ -33,8 +32,6 @@ USER_PROMPT="${USER_PROMPT//\$REPO_FILES/$REPO_FILES}"
 USER_PROMPT="${USER_PROMPT//\$README_TAIL/$README_TAIL}"
 
 MODEL_NAME="qwen2.5-coder:7b-instruct"
-
-# Ollama HTTP helpers
 curl -fsS http://127.0.0.1:11434/api/tags >/dev/null
 ollama pull "$MODEL_NAME" || true
 
@@ -55,29 +52,45 @@ chat_request() {
 
 sanitize_ascii() { tr -cd '\11\12\15\40-\176'; }
 
+# Extract payload helper:
+# 1) sentinel-bounded
+# 2) first triple-backtick fenced block (any language)
+# 3) whole body
 extract_payload() {
-  # 1) Sentinel-bounded payload
+  # try sentinels
   awk '
-    /^<<<BEGIN_PATCH$/ {inblk=1; next}
-    /^END_PATCH>>>$/   { if(inblk){exit 0} }
-    { if(inblk) print }
-    END{ if(inblk) exit 0; else exit 1 }
+    /^<<<BEGIN_PATCH$/ {ib=1; next}
+    /^END_PATCH>>>$/   { if(ib){exit 0} }
+    { if(ib) print }
+    END{ if(ib) exit 0; else exit 1 }
   ' > patch.payload 2>/dev/null || true
+  [[ -s patch.payload ]] && return 0
 
-  [[ -s patch.payload ]]
+  # try first code fence
+  awk '
+    BEGIN{f=0}
+    /^```/ {
+      if(f==0){f=1; next}
+      else if(f==1){f=2; exit}
+    }
+    { if(f==1) print }
+  ' model.out > patch.payload 2>/dev/null || true
+  [[ -s patch.payload ]] && return 0
+
+  # fallback: whole body
+  cp model.out patch.payload
 }
 
+# Python FILE-block parser
 parse_and_apply_file_blocks() {
   python3 - "$@" <<'PY' || exit 1
 import os, sys, re, subprocess
 
 payload = sys.stdin.read().replace('\r\n','\n').replace('\r','\n')
 
-pattern = re.compile(
-    r'^FILE:\s+([^\n]+)\n-----BEGIN FILE-----\n(.*?)\n-----END FILE-----\n?',
-    re.S | re.M
-)
-blocks = pattern.findall(payload)
+pat = re.compile(r'^FILE:\s+([^\n]+)\n-----BEGIN FILE-----\n(.*?)\n-----END FILE-----\n?',
+                 re.S|re.M)
+blocks = pat.findall(payload)
 if not blocks:
     print("No FILE blocks matched", file=sys.stderr)
     sys.exit(2)
@@ -107,36 +120,35 @@ sys.stdout.write(diff)
 PY
 }
 
-# Pass 1: normal prompt (already FILE-only)
+# Pass 1: normal prompt
 RESP="$(chat_request "$SYSTEM_PROMPT" "$USER_PROMPT" | sanitize_ascii)"
 printf '%s' "$RESP" > model.out
+extract_payload
 
-if ! extract_payload < model.out; then
-  # Pass 2: ultra-strict user reminder
-  STRICT=$'Return ONLY sentinel-wrapped FILE blocks.\nFormat:\n<<<BEGIN_PATCH\nFILE: <relative/path>\n-----BEGIN FILE-----\n<entire file content>\n-----END FILE-----\nEND_PATCH>>>\nNo prose.'
-  RESP="$(chat_request "$SYSTEM_PROMPT" "$STRICT" | sanitize_ascii)"
-  printf '%s' "$RESP" > model.out
-  extract_payload < model.out >/dev/null || true
-fi
-
-if ! [[ -s patch.payload ]]; then
-  echo "Model output missing sentinels or empty payload. First lines:"
-  sed -n '1,60p' model.out
-  exit 1
-fi
-
-# NO_CHANGES
+# Accept NO_CHANGES
 if grep -qx 'NO_CHANGES' patch.payload; then
   echo "NO_CHANGES from model; nothing to apply."
   exit 0
 fi
 
-# Apply FILE blocks
+# Try to parse and apply FILE blocks
 DIFF_FROM_FILES="$(parse_and_apply_file_blocks < patch.payload || true)"
 if [[ -z "${DIFF_FROM_FILES:-}" ]]; then
-  echo "Malformed or empty FILE blocks."
-  sed -n '1,80p' patch.payload
-  exit 1
+  # Pass 2: ultra-strict reminder + example inside code fence
+  STRICT=$'Return ONLY FILE blocks as specified. Example format:\n``` \nFILE: path/to/file\n-----BEGIN FILE-----\n<content>\n-----END FILE-----\n```\nNo prose.'
+  RESP="$(chat_request "$SYSTEM_PROMPT" "$STRICT" | sanitize_ascii)"
+  printf '%s' "$RESP" > model.out
+  extract_payload
+  if grep -qx 'NO_CHANGES' patch.payload; then
+    echo "NO_CHANGES from model; nothing to apply."
+    exit 0
+  fi
+  DIFF_FROM_FILES="$(parse_and_apply_file_blocks < patch.payload || true)"
+  if [[ -z "${DIFF_FROM_FILES:-}" ]]; then
+    echo "Malformed or empty FILE blocks."
+    sed -n '1,80p' patch.payload
+    exit 1
+  fi
 fi
 
 printf '%s' "$DIFF_FROM_FILES" > patch.diff
