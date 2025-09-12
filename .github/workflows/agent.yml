@@ -44,6 +44,9 @@ jobs:
 
       - name: Run agent
         env:
+          OLLAMA_NO_TTY: '1'
+          TERM: 'dumb'
+        env:
           AGENT_TOKEN: ${{ secrets.AGENT_TOKEN }}
         run: |
           export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"

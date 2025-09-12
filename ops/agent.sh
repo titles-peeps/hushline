@@ -1,14 +1,12 @@
 #!/bin/bash
 set -euo pipefail
 
-# --- read issue context from GitHub event payload ---
 ISSUE_NUMBER="$(jq -r .issue.number "$GITHUB_EVENT_PATH")"
 ISSUE_TITLE="$(jq -r .issue.title "$GITHUB_EVENT_PATH")"
 ISSUE_BODY="$(jq -r .issue.body "$GITHUB_EVENT_PATH")"
 
 echo "Agent triggered for issue #${ISSUE_NUMBER}: ${ISSUE_TITLE}"
 
-# --- minimal repo context for the prompt ---
 REPO_FILES="$(git ls-files | sed -e 's/^/  - /')"
 if [[ -f README.md ]]; then
   README_TAIL="$(tail -n 20 README.md | sed -e 's/^/    /')"
@@ -16,11 +14,9 @@ else
   README_TAIL="    <README.md not found>"
 fi
 
-# --- build prompt from YAML template (system + user) ---
 SYSTEM_PROMPT=""
 USER_TEMPLATE=""
 section=""
-
 while IFS= read -r line || [[ -n "$line" ]]; do
   if [[ "$line" =~ ^system: ]]; then section="system"; continue
   elif [[ "$line" =~ ^user: ]]; then section="user"; continue; fi
@@ -40,15 +36,20 @@ USER_PROMPT="${USER_PROMPT//\$README_TAIL/$README_TAIL}"
 FINAL_PROMPT="${SYSTEM_PROMPT}
 ${USER_PROMPT}"
 
-# --- model invocation (Ollama reads prompt from stdin) ---
 MODEL_NAME="qwen2.5-coder:7b-instruct"
 echo "Pulling LLM model ($MODEL_NAME) if not already present..."
 ollama pull "$MODEL_NAME" || true
 
 echo "Running LLM to generate output..."
-echo -e "$FINAL_PROMPT" | ollama run "$MODEL_NAME" > model.out
+# Force non-interactive, non-TTY behavior; strip all control chars/ANSI from stdout.
+# Keep stderr separately for debug.
+export TERM=dumb
+export OLLAMA_NO_TTY=1
+echo -e "$FINAL_PROMPT" \
+  | ollama run "$MODEL_NAME" 2>model.stderr \
+  | tr -cd '\11\12\15\40-\176' \
+  > model.out
 
-# --- helpers ---
 extract_unified_diff() {
   if grep -q '^```diff' model.out; then
     awk '/^```diff/{f=1;next} /^```$/{f=0} f' model.out > patch.body || true
@@ -60,19 +61,16 @@ extract_unified_diff() {
 }
 
 apply_unified_diff() {
-  # try fast path
   if git apply --check patch.diff 2>/dev/null; then
     git apply patch.diff
     echo "Patch applied."
     return 0
   fi
-  # try whitespace fix
   if git apply --check --whitespace=fix patch.diff 2>/dev/null; then
     git apply --whitespace=fix patch.diff
     echo "Patch applied with whitespace fix."
     return 0
   fi
-  # try 3-way merge
   if git apply --check --3way patch.diff 2>/dev/null; then
     git apply --3way patch.diff
     echo "Patch applied with 3-way merge."
@@ -121,7 +119,6 @@ PY
   [[ -s patch.diff ]]
 }
 
-# --- decision: NO_CHANGES, unified diff, or file blocks ---
 if grep -qx 'NO_CHANGES' model.out; then
   echo "NO_CHANGES from model; nothing to apply."
   exit 0
@@ -140,18 +137,18 @@ else
     echo "Applied FILE blocks and built working-tree diff."
   else
     echo "Model output not usable (neither valid diff nor valid FILE blocks). First lines:"
-    sed -n '1,60p' model.out
+    sed -n '1,80p' model.out
+    echo "--- stderr ---"
+    sed -n '1,80p' model.stderr
     exit 1
   fi
 fi
 
-# --- format code (user-space tools) ---
 export PATH="$HOME/.local/bin:$PATH"
 python3 -m pip install --user --no-cache-dir black isort >/dev/null 2>&1 || true
 command -v isort >/dev/null 2>&1 && isort . || true
 command -v black >/dev/null 2>&1 && black . || true
 
-# --- commit, push, PR ---
 BRANCH_NAME="agent-issue-${ISSUE_NUMBER}"
 git config user.name "Hushline Agent Bot"
 git config user.email "titles-peeps@users.noreply.github.com"
