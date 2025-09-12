@@ -1,11 +1,13 @@
 #!/bin/bash
 set -euo pipefail
 
+# ---------- Inputs ----------
 ISSUE_NUMBER="$(jq -r .issue.number "$GITHUB_EVENT_PATH")"
 ISSUE_TITLE="$(jq -r .issue.title "$GITHUB_EVENT_PATH")"
 ISSUE_BODY="$(jq -r .issue.body  "$GITHUB_EVENT_PATH")"
 echo "Agent triggered for issue #${ISSUE_NUMBER}: ${ISSUE_TITLE}"
 
+# ---------- Repo context for prompt ----------
 REPO_FILES="$(git ls-files | sed -e 's/^/  - /')"
 if [[ -f README.md ]]; then
   README_TAIL="$(tail -n 20 README.md | sed -e 's/^/    /')"
@@ -13,6 +15,7 @@ else
   README_TAIL="    <README.md not found>"
 fi
 
+# ---------- Build prompt from YAML ----------
 SYSTEM_PROMPT=""
 USER_TEMPLATE=""
 section=""
@@ -31,120 +34,179 @@ USER_PROMPT="${USER_PROMPT//\$REPO_FILES/$REPO_FILES}"
 USER_PROMPT="${USER_PROMPT//\$README_TAIL/$README_TAIL}"
 
 MODEL_NAME="qwen2.5-coder:7b-instruct"
+
+# ---------- Ollama HTTP helpers ----------
+ollama_health() {
+  curl -fsS http://127.0.0.1:11434/api/tags >/dev/null
+}
+ollama_health || { echo "Ollama API not responding"; exit 1; }
 ollama pull "$MODEL_NAME" || true
 
-# Health check
-curl -fsS http://127.0.0.1:11434/api/tags >/dev/null
+chat_request() {
+  local system_msg="$1"
+  local user_msg="$2"
+  jq -n \
+    --arg model "$MODEL_NAME" \
+    --arg sys   "$system_msg" \
+    --arg usr   "$user_msg" \
+    --argjson opts '{"temperature":0,"num_ctx":8192,"repeat_penalty":1.1}' \
+    '{model:$model,stream:false,options:$opts,
+      messages:[{role:"system",content:$sys},{role:"user",content:$usr}]}' \
+  | curl -fsS -X POST http://127.0.0.1:11434/api/chat \
+      -H 'Content-Type: application/json' \
+      -d @- \
+  | jq -r '.message.content // .response // empty'
+}
 
-# Build /api/chat request (stream:false)
-REQ=$(jq -n \
-  --arg model "$MODEL_NAME" \
-  --arg sys   "$SYSTEM_PROMPT" \
-  --arg usr   "$USER_PROMPT" \
-  --argjson opts '{"temperature":0,"num_ctx":8192}' \
-  '{model:$model,stream:false,options:$opts,messages:[{role:"system",content:$sys},{role:"user",content:$usr}]}')
+sanitize_ascii() {
+  tr -cd '\11\12\15\40-\176'
+}
 
-# Call Ollama and sanitize control chars
-curl -fsS -X POST http://127.0.0.1:11434/api/chat \
-  -H 'Content-Type: application/json' \
-  -d "$REQ" \
-  | jq -r '.message.content // .response // empty' \
-  | tr -cd '\11\12\15\40-\176' > model.out
-
-# 1) Prefer sentinel-bounded payload
-awk '
-  /^<<<BEGIN_PATCH$/ {inside=1; next}
-  /^END_PATCH>>>$/   { if(inside) {exit 0} }
-  { if(inside) print }
-  END{ if(inside) exit 0; else exit 1 }
-' model.out > patch.payload || true
-
-# 2) If no sentinels, accept ```diff fenced, else accept whole body
-if ! [[ -s patch.payload ]]; then
-  if grep -q '^```diff' model.out; then
-    awk '/^```diff/{f=1;next} /^```$/{f=0} f' model.out > patch.payload || true
-  else
-    cp model.out patch.payload
-  fi
-fi
-
-# Accept NO_CHANGES
-if grep -qx 'NO_CHANGES' patch.payload; then
-  echo "NO_CHANGES from model; nothing to apply."
-  exit 0
-fi
-
-# Try unified diff first
-if grep -q '^diff --git ' patch.payload; then
-  awk '/^diff --git /{p=1} p' patch.payload > patch.diff
-  if git apply --check patch.diff 2>/dev/null; then
-    git apply patch.diff
-    echo "Patch applied."
-  elif git apply --check --whitespace=fix patch.diff 2>/dev/null; then
-    git apply --whitespace=fix patch.diff
-    echo "Patch applied with whitespace fix."
-  elif git apply --check --3way patch.diff 2>/dev/null; then
-    git apply --3way patch.diff
-    echo "Patch applied with 3-way merge."
-  else
-    echo "Unified diff present but failed to apply:"
-    sed -n '1,80p' patch.diff
-    exit 1
-  fi
-else
-  # FALLBACK: FILE blocks
-  rm -f .agent.changed.list .agent.write.stream
+# ---------- Parse payload (sentinels, then fences, else raw) ----------
+extract_payload() {
+  # 1) sentinels
   awk '
-    BEGIN{ok=0}
-    /^FILE: /{ if(infile){exit 2}; path=substr($0,7); next }
-    /^-----BEGIN FILE-----$/ { if(length(path)==0){exit 2}; infile=1; content=""; next }
-    /^-----END FILE-----$/ {
-      print path >> ".agent.changed.list"
-      printf("WRITE\0%s\0%s\0\n", path, content) >> ".agent.write.stream"
-      infile=0; path=""; content=""; ok=1; next
-    }
-    { if(infile){ content = content $0 "\n" } }
-    END{ if(infile){exit 2}; exit ok?0:1 }
-  ' patch.payload || { echo "Malformed FILE blocks."; exit 1; }
+    /^<<<BEGIN_PATCH$/ {inblk=1; next}
+    /^END_PATCH>>>$/   { if(inblk){exit 0} }
+    { if(inblk) print }
+    END{ if(inblk) exit 0; else exit 1 }
+  ' > patch.payload 2>/dev/null || true
 
-  python3 - <<'PY' < .agent.write.stream
-import os,sys
-data=sys.stdin.buffer.read().split(b'\0')
-i=0
-while i+3 <= len(data):
-    if data[i] != b'WRITE': break
-    path=data[i+1].decode()
-    content=data[i+2]
-    i+=3
-    d=os.path.dirname(path)
+  if [[ -s patch.payload ]]; then return 0; fi
+
+  # 2) ```diff fences
+  awk '/^```diff/{f=1;next} /^```$/{f=0} f' > patch.payload 2>/dev/null || true
+  if [[ -s patch.payload ]]; then return 0; fi
+
+  # 3) raw as last resort
+  cat > patch.payload
+}
+
+# ---------- FILE blocks parser (robust, Python) ----------
+apply_file_blocks() {
+  python3 - "$@" <<'PY' || exit 1
+import os, sys, re, json, subprocess, textwrap
+
+payload = sys.stdin.read()
+
+# Normalize newlines
+payload = payload.replace('\r\n','\n').replace('\r','\n')
+
+# Strict FILE block regex
+pattern = re.compile(
+    r'^FILE:\s+([^\n]+)\n-----BEGIN FILE-----\n(.*?)\n-----END FILE-----\n?',
+    re.S | re.M
+)
+
+blocks = pattern.findall(payload)
+if not blocks:
+    print("No FILE blocks matched", file=sys.stderr)
+    sys.exit(2)
+
+changed_paths = []
+for path, content in blocks:
+    path = path.strip()
+    if not path or path.startswith('/') or '..' in path.split('/'):
+        print(f"Refusing unsafe path: {path}", file=sys.stderr)
+        sys.exit(3)
+    d = os.path.dirname(path)
     if d and not os.path.isdir(d):
         os.makedirs(d, exist_ok=True)
-    with open(path,'wb') as f:
-        f.write(content)
-PY
+    with open(path, 'wb') as f:
+        f.write(content.encode('utf-8', 'surrogatepass'))
+    changed_paths.append(path)
 
-  if [[ -f .agent.changed.list ]]; then
-    sort -u .agent.changed.list | while read -r p; do
-      [[ -n "$p" ]] && git add -N -- "$p" || true
-    done
+# Stage intent and emit a unified diff
+for p in sorted(set(changed_paths)):
+    subprocess.run(["git","add","-N","--",p], check=False)
+
+# Capture diff to stdout
+diff = subprocess.run(["git","diff"], capture_output=True, text=True).stdout
+if not diff.strip():
+    print("FILE blocks produced no effective diff", file=sys.stderr)
+    sys.exit(4)
+
+sys.stdout.write(diff)
+PY
+}
+
+# ---------- Apply unified diff with fallbacks ----------
+apply_unified_diff() {
+  if git apply --check patch.diff 2>/dev/null; then
+    git apply patch.diff; echo "Patch applied."; return 0
   fi
-  git diff > patch.diff || true
-  if ! [[ -s patch.diff ]]; then
-    echo "No effective changes from FILE blocks."
-    exit 1
+  if git apply --check --whitespace=fix patch.diff 2>/dev/null; then
+    git apply --whitespace=fix patch.diff; echo "Patch applied with whitespace fix."; return 0
   fi
-  git apply --check patch.diff || true
-  git apply patch.diff || true
-  echo "Applied FILE blocks."
+  if git apply --check --3way patch.diff 2>/dev/null; then
+    git apply --3way patch.diff; echo "Patch applied with 3-way merge."; return 0
+  fi
+  return 1
+}
+
+# ---------- Generation + parsing loop (2 passes) ----------
+PASS=1
+MAX_PASS=2
+VALID=0
+while (( PASS <= MAX_PASS )); do
+  if (( PASS == 1 )); then
+    RESP="$(chat_request "$SYSTEM_PROMPT" "$USER_PROMPT" | sanitize_ascii)"
+  else
+    STRICT_USER=$'Return ONLY FALLBACK FILE blocks wrapped in sentinels.\nFormat:\n<<<BEGIN_PATCH\nFILE: <relative/path>\n-----BEGIN FILE-----\n<entire file content>\n-----END FILE-----\nEND_PATCH>>>\nNo prose.'
+    RESP="$(chat_request "$SYSTEM_PROMPT" "$STRICT_USER" | sanitize_ascii)"
+  fi
+
+  printf '%s' "$RESP" > model.out
+
+  # Extract payload
+  extract_payload < model.out
+
+  # NO_CHANGES?
+  if grep -qx 'NO_CHANGES' patch.payload; then
+    echo "NO_CHANGES from model; nothing to apply."
+    exit 0
+  fi
+
+  # If unified diff present, try to apply
+  if grep -q '^diff --git ' patch.payload; then
+    awk '/^diff --git /{p=1} p' patch.payload > patch.diff
+    if apply_unified_diff; then
+      VALID=1
+      break
+    else
+      echo "Unified diff present but failed to apply on pass $PASS." >&2
+    fi
+  else
+    # Try FILE blocks
+    DIFF_FROM_FILES="$(apply_file_blocks < patch.payload || true)"
+    if [[ -n "${DIFF_FROM_FILES:-}" ]]; then
+      printf '%s' "$DIFF_FROM_FILES" > patch.diff
+      git apply --check patch.diff 2>/dev/null || true
+      git apply patch.diff 2>/dev/null || true
+      echo "Applied FILE blocks."
+      VALID=1
+      break
+    else
+      echo "Malformed or empty FILE blocks on pass $PASS." >&2
+    fi
+  fi
+
+  PASS=$((PASS+1))
+done
+
+if (( ! VALID )); then
+  echo "Model output not usable after $MAX_PASS passes. First lines:" >&2
+  sed -n '1,80p' model.out >&2
+  exit 1
 fi
 
-# Format (user-space)
+# ---------- Format (user-space) ----------
 export PATH="$HOME/.local/bin:$PATH"
 python3 -m pip install --user --no-cache-dir black isort >/dev/null 2>&1 || true
 command -v isort >/dev/null 2>&1 && isort . || true
 command -v black  >/dev/null 2>&1 && black .  || true
 
-# Commit / push / PR
+# ---------- Commit / push / PR ----------
 BRANCH_NAME="agent-issue-${ISSUE_NUMBER}"
 git config user.name "Hushline Agent Bot"
 git config user.email "titles-peeps@users.noreply.github.com"
