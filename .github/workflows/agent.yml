@@ -1,54 +1,50 @@
-name: agent
-
+name: Agent Automation
 on:
   issues:
     types: [labeled]
-  workflow_dispatch:
-    inputs:
-      issue:
-        description: "Issue number to work on"
-        required: true
 
 jobs:
   run-agent:
-    if: >
-      (github.event_name == 'issues' && contains(github.event.label.name, 'agent'))
-      || (github.event_name == 'workflow_dispatch')
+    if: ${{ github.event.label.name == 'agent' }}
     runs-on: self-hosted
-
-    env:
-      # --- required envs (names unchanged) ---
-      GH_TOKEN: ${{ secrets.AGENT_TOKEN }}
-      # Point Aider/LiteLLM at your local Ollama
-      OLLAMA_API_BASE: http://127.0.0.1:11434
-      # Force provider detection (belt & suspenders)
-      LITELLM_PROVIDER: ollama
-      # Use chat endpoint, with explicit provider prefix Aider expects
-      AIDER_MODEL: ollama_chat/qwen2.5-coder:7b-instruct
-
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
     steps:
-      - name: Checkout
+      - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Show issue being processed
-        shell: bash
+      - name: Ensure user-space Python tools and jq
         run: |
-          set -euo pipefail
-          if [ "${{ github.event_name }}" = "issues" ]; then
-            echo "Will work on issue #${{ github.event.issue.number }}"
-            echo "ISSUE_NUM=${{ github.event.issue.number }}" >> "$GITHUB_ENV"
-          else
-            echo "Will work on issue #${{ inputs.issue }}"
-            echo "ISSUE_NUM=${{ inputs.issue }}" >> "$GITHUB_ENV"
+          python3 -m pip install --user --upgrade pip
+          python3 -m pip install --user black isort
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          if ! command -v jq >/dev/null 2>&1; then
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+              x86_64)  JQ_URL="https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64" ;;
+              aarch64|arm64) JQ_URL="https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-arm64" ;;
+              *) echo "Unsupported arch: $ARCH" ; exit 1 ;;
+            esac
+            mkdir -p "$RUNNER_TEMP/bin"
+            curl -fsSL "$JQ_URL" -o "$RUNNER_TEMP/bin/jq"
+            chmod +x "$RUNNER_TEMP/bin/jq"
+            echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
           fi
 
-      - name: Run agent
-        shell: bash
+      - name: Verify prerequisites
         run: |
-          set -euo pipefail
-          # Keep the machine stable
-          ulimit -n 4096 || true
-          ulimit -v 2097152 || true   # 2GB virtual mem cap (adjust if needed)
-          ionice -c2 -n7 -- bash ops/agent.sh "${ISSUE_NUM}"
+          git --version
+          jq --version
+          black --version
+          isort --version
+          command -v ollama && ollama --version || (echo "ollama not on PATH" && exit 1)
+          ollama list || true
+
+      - name: Run agent
+        env:
+          AGENT_TOKEN: ${{ secrets.AGENT_TOKEN }}
+        run: |
+          export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+          bash ops/agent.sh
