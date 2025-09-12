@@ -1,111 +1,84 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 
-# --- required env (names unchanged) ---
-: "${GH_TOKEN:?GH_TOKEN is required}"
-export GITHUB_TOKEN="$GH_TOKEN"
+ISSUE_NUMBER="$(jq -r .issue.number "$GITHUB_EVENT_PATH")"
+ISSUE_TITLE="$(jq -r .issue.title "$GITHUB_EVENT_PATH")"
+ISSUE_BODY="$(jq -r .issue.body "$GITHUB_EVENT_PATH")"
 
-# --- Ollama + LiteLLM/Aider wiring (keeps Aider from guessing providers) ---
-export OLLAMA_API_BASE="${OLLAMA_API_BASE:-http://127.0.0.1:11434}"
-export LITELLM_PROVIDER="${LITELLM_PROVIDER:-ollama}"
+echo "Agent triggered for issue #${ISSUE_NUMBER}: $ISSUE_TITLE"
 
-# Keep memory/VRAM pressure low on Jetson:
-export OLLAMA_NUM_CTX="${OLLAMA_NUM_CTX:-1024}"
-export OLLAMA_NUM_BATCH="${OLLAMA_NUM_BATCH:-16}"
-export OLLAMA_NUM_THREAD="${OLLAMA_NUM_THREAD:-4}"
+SYSTEM_PROMPT=""
+USER_TEMPLATE=""
+current_section=""
 
-# Use your lighter, custom model if present; fall back to the stock tag.
-MODEL="${AIDER_MODEL:-ollama_chat/qwen2.5-coder:7b-instruct-hushline}"
-if ! curl -fsS "$OLLAMA_API_BASE/api/tags" | jq -e --arg m "qwen2.5-coder:7b-instruct-hushline" '.models[].name == $m' >/dev/null 2>&1; then
-  MODEL="ollama_chat/qwen2.5-coder:7b-instruct"
+while IFS= read -r line || [[ -n "$line" ]]; do
+  if [[ "$line" =~ ^system: ]]; then
+    current_section="system"; continue
+  elif [[ "$line" =~ ^user: ]]; then
+    current_section="user"; continue
+  fi
+  trimmed="${line#  }"
+  if [[ "$current_section" == "system" ]]; then
+    SYSTEM_PROMPT+="${trimmed}"$'\n'
+  elif [[ "$current_section" == "user" ]]; then
+    USER_TEMPLATE+="${trimmed}"$'\n'
+  fi
+done < ops/agent_prompt.yml
+
+ph_title="\$ISSUE_TITLE"
+ph_body="\$ISSUE_BODY"
+USER_PROMPT="${USER_TEMPLATE//$ph_title/$ISSUE_TITLE}"
+USER_PROMPT="${USER_PROMPT//$ph_body/$ISSUE_BODY}"
+
+FINAL_PROMPT="${SYSTEM_PROMPT}\n${USER_PROMPT}"
+
+MODEL_NAME="qwen2.5-coder:7b-instruct"
+echo "Pulling LLM model ($MODEL_NAME) if not already present..."
+ollama pull "$MODEL_NAME" || true
+
+echo "Running LLM to generate code patch..."
+ollama generate -m "$MODEL_NAME" -p "$FINAL_PROMPT" > patch.diff
+
+sed -i.bak -e 's/^```diff//; s/^```//; s/```$//' patch.diff || true
+
+if ! git apply --check patch.diff; then
+  echo "❌ The proposed patch could not be applied cleanly. Exiting."
+  exit 1
 fi
+git apply patch.diff
+echo "✅ Patch applied to the working directory."
 
-ISSUE_NUM="${1:?usage: ops/agent.sh <issue_number>}"
+echo "Formatting code with black and isort..."
+export PATH="$HOME/.local/bin:$PATH"
+python3 -m pip install --user --no-cache-dir black isort >/dev/null 2>&1 || true
+isort . && black .
 
-# Detect repo from git remote; fallback
-REPO="${REPO:-$(git remote get-url origin 2>/dev/null | sed -n 's#.*github.com[:/]\(.*\.git\)#\1#p' | sed 's/\.git$//')}"
-REPO="${REPO:-titles-peeps/hushline}"
-
-# Ensure tools
-for b in gh git aider jq curl; do
-  command -v "$b" >/dev/null || { echo "missing: $b"; exit 1; }
-done
-
-# Fetch issue data (preserve newlines)
-ISSUE_TITLE="$(gh issue view "$ISSUE_NUM" -R "$REPO" --json title -q .title)"
-ISSUE_BODY="$(gh issue view "$ISSUE_NUM" -R "$REPO" --json body  -q .body)"
-
-# Determine default branch
-DEFAULT_BRANCH="$(gh repo view "$REPO" --json defaultBranchRef -q .defaultBranchRef.name 2>/dev/null || true)"
-DEFAULT_BRANCH="${DEFAULT_BRANCH:-$(git remote show origin 2>/dev/null | sed -n 's/.*HEAD branch: //p')}"
-DEFAULT_BRANCH="${DEFAULT_BRANCH:-main}"
-
-# Create working branch
-BR="agent/issue-${ISSUE_NUM}-$(date +%Y%m%d-%H%M%S)"
-git fetch origin --prune
-git checkout -B "$BR" "origin/$DEFAULT_BRANCH"
-
-# Minimal prompt
-cat > /tmp/agent_prompt.txt <<EOF
-You are the Hush Line code assistant. Work only in this repository.
-
-Issue #: ${ISSUE_NUM}
-Title: ${ISSUE_TITLE}
-
-Task:
-- Make the smallest necessary change to implement the issue.
-- Follow repo conventions; no new services/env vars.
-- Output unified diffs only (no prose).
-
-Context:
-${ISSUE_BODY}
-EOF
-
-# Try to hint Aider with any file paths mentioned in the body (generic, no language special-casing)
-mapfile -t TARGET_FILES < <(
-  printf '%s\n' "$ISSUE_BODY" |
-    grep -Eo '([A-Za-z0-9._/-]+\.(py|js|ts|tsx|jsx|css|scss|html|jinja2|yml|yaml|sh))' |
-    sort -u |
-    while read -r f; do [[ -f "$f" ]] && echo "$f"; done
-)
-
-# Keep Aider's memory footprint tiny
-AIDER_ARGS=(
-  --yes
-  --no-gitignore
-  --model "$MODEL"
-  --edit-format udiff
-  --timeout 90
-  --no-stream
-  --map-refresh files
-  --map-multiplier-no-files 0
-  --map-tokens 64
-  --max-chat-history-tokens 384
-)
-
-# Run aider (single pass)
-if [[ ${#TARGET_FILES[@]} -gt 0 ]]; then
-  aider "${AIDER_ARGS[@]}" --message "$(cat /tmp/agent_prompt.txt)" "${TARGET_FILES[@]}" || true
-else
-  aider "${AIDER_ARGS[@]}" --message "$(cat /tmp/agent_prompt.txt)" || true
-fi
-
-# If nothing changed, just note it and exit cleanly
-if git diff --quiet && git diff --cached --quiet; then
-  gh issue comment "$ISSUE_NUM" -R "$REPO" -b "Agent attempted patch but produced no changes."
-  exit 0
-fi
-
-# Commit, push, PR
+BRANCH_NAME="agent-issue-${ISSUE_NUMBER}"
+git config user.name "Hushline Agent Bot"
+git config user.email "titles-peeps@users.noreply.github.com"
+git checkout -b "$BRANCH_NAME"
 git add -A
-git commit -m "Agent patch for #${ISSUE_NUM}: ${ISSUE_TITLE}" || true
-git push -u origin "$BR"
+git commit -m "Fix(#${ISSUE_NUMBER}): $ISSUE_TITLE"
 
-PR_NUM="$(gh pr list -R "$REPO" --head "$BR" --json number -q '.[0].number' || true)"
-if [[ -z "$PR_NUM" ]]; then
-  gh pr create -R "$REPO" -t "Agent patch for #${ISSUE_NUM}: ${ISSUE_TITLE}" -b "Automated patch for #${ISSUE_NUM}."
+echo "Pushing branch '$BRANCH_NAME' to fork..."
+git push "https://x-access-token:${AGENT_TOKEN}@github.com/titles-peeps/hushline.git" "$BRANCH_NAME"
+
+PR_TITLE="Fix: $ISSUE_TITLE"
+PR_BODY="Closes #${ISSUE_NUMBER} (automated AI PR)."
+
+echo "Creating pull request on main repo..."
+API_JSON=$(printf '%s' \
+  "{\"head\":\"titles-peeps:${BRANCH_NAME}\",\"base\":\"main\"," \
+  "\"title\":\"${PR_TITLE//\"/\\\"}\",\"body\":\"${PR_BODY//\"/\\\"}\"}")
+RESPONSE=$(curl -s -X POST -H "Authorization: token ${AGENT_TOKEN}" \
+           -H "Content-Type: application/json" \
+           -d "${API_JSON}" \
+           "https://api.github.com/repos/scidsg/hushline/pulls")
+
+PR_URL=$(echo "$RESPONSE" | jq -r .html_url 2>/dev/null || echo "")
+if [[ -n "$PR_URL" && "$PR_URL" != "null" ]]; then
+  echo "✅ Pull request created: $PR_URL"
 else
-  gh pr comment -R "$REPO" "$PR_NUM" -b "Updated patch."
+  echo "❌ Failed to create pull request. Response: $RESPONSE"
+  exit 1
 fi
-
-gh issue comment "$ISSUE_NUM" -R "$REPO" -b "Agent created/updated PR from branch \`$BR\`."
