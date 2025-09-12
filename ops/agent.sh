@@ -1,13 +1,11 @@
 #!/bin/bash
 set -euo pipefail
 
-# Inputs
 ISSUE_NUMBER="$(jq -r .issue.number "$GITHUB_EVENT_PATH")"
 ISSUE_TITLE="$(jq -r .issue.title "$GITHUB_EVENT_PATH")"
 ISSUE_BODY="$(jq -r .issue.body  "$GITHUB_EVENT_PATH")"
 echo "Agent triggered for issue #${ISSUE_NUMBER}: ${ISSUE_TITLE}"
 
-# Repo context
 REPO_FILES="$(git ls-files | sed -e 's/^/  - /')"
 if [[ -f README.md ]]; then
   README_TAIL="$(tail -n 20 README.md | sed -e 's/^/    /')"
@@ -15,7 +13,6 @@ else
   README_TAIL="    <README.md not found>"
 fi
 
-# Build prompt from YAML
 SYSTEM_PROMPT=""
 USER_TEMPLATE=""
 section=""
@@ -24,7 +21,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
   elif [[ "$line" =~ ^user: ]]; then section="user"; continue; fi
   trimmed="${line#  }"
   if [[ "$section" == "system" ]]; then SYSTEM_PROMPT+="${trimmed}"$'\n'
-  elif [[ "$section" == "user" ]]; then USER_TEMPLATE+="${trimmed}"$'\n'
+  elif [[ "$section" == "user"   ]]; then USER_TEMPLATE+="${trimmed}"$'\n'
   fi
 done < ops/agent_prompt.yml
 
@@ -33,52 +30,42 @@ USER_PROMPT="${USER_PROMPT//\$ISSUE_BODY/$ISSUE_BODY}"
 USER_PROMPT="${USER_PROMPT//\$REPO_FILES/$REPO_FILES}"
 USER_PROMPT="${USER_PROMPT//\$README_TAIL/$README_TAIL}"
 
-# Model
 MODEL_NAME="qwen2.5-coder:7b-instruct"
 ollama pull "$MODEL_NAME" || true
 
 # Health check
 curl -fsS http://127.0.0.1:11434/api/tags >/dev/null
 
-# Compose chat request (stream:false for clean JSON)
-SYSTEM_JSON=$(printf '%s' "$SYSTEM_PROMPT" | jq -Rs .)
-USER_JSON=$(printf '%s' "$USER_PROMPT"   | jq -Rs .)
+# Build /api/chat request (stream:false)
+REQ=$(jq -n \
+  --arg model "$MODEL_NAME" \
+  --arg sys   "$SYSTEM_PROMPT" \
+  --arg usr   "$USER_PROMPT" \
+  --argjson opts '{"temperature":0,"num_ctx":8192}' \
+  '{model:$model,stream:false,options:$opts,messages:[{role:"system",content:$sys},{role:"user",content:$usr}]}')
 
-REQ=$(jq -n --arg model "$MODEL_NAME" \
-            --arg sys   "$SYSTEM_PROMPT" \
-            --arg usr   "$USER_PROMPT" \
-            --argjson opts '{"temperature":0,"num_ctx":8192}' '
-{
-  model: $model,
-  stream: false,
-  options: $opts,
-  messages: [
-    {role:"system", content:$sys},
-    {role:"user",   content:$usr}
-  ]
-}')
-
-# Call Ollama chat API
+# Call Ollama and sanitize control chars
 curl -fsS -X POST http://127.0.0.1:11434/api/chat \
   -H 'Content-Type: application/json' \
   -d "$REQ" \
-  | jq -r '.message.content' > model.raw
+  | jq -r '.message.content // .response // empty' \
+  | tr -cd '\11\12\15\40-\176' > model.out
 
-# Sanitize control chars; keep TAB, LF, CR, and printable ASCII
-tr -cd '\11\12\15\40-\176' < model.raw > model.out
-
-# Extract between sentinels
+# 1) Prefer sentinel-bounded payload
 awk '
-  /^<<<BEGIN_PATCH$/ {in=1; next}
-  /^END_PATCH>>>$/   {if(in){exit 0}}
-  { if(in) print }
-  END{ if(in) exit 1 }
+  /^<<<BEGIN_PATCH$/ {inside=1; next}
+  /^END_PATCH>>>$/   { if(inside) {exit 0} }
+  { if(inside) print }
+  END{ if(inside) exit 0; else exit 1 }
 ' model.out > patch.payload || true
 
+# 2) If no sentinels, accept ```diff fenced, else accept whole body
 if ! [[ -s patch.payload ]]; then
-  echo "Model output missing sentinels or empty payload. First lines:"
-  sed -n '1,60p' model.out
-  exit 1
+  if grep -q '^```diff' model.out; then
+    awk '/^```diff/{f=1;next} /^```$/{f=0} f' model.out > patch.payload || true
+  else
+    cp model.out patch.payload
+  fi
 fi
 
 # Accept NO_CHANGES
@@ -100,12 +87,12 @@ if grep -q '^diff --git ' patch.payload; then
     git apply --3way patch.diff
     echo "Patch applied with 3-way merge."
   else
-    echo "Unified diff present but failed to apply. Aborting."
+    echo "Unified diff present but failed to apply:"
     sed -n '1,80p' patch.diff
     exit 1
   fi
 else
-  # FALLBACK FILE blocks
+  # FALLBACK: FILE blocks
   rm -f .agent.changed.list .agent.write.stream
   awk '
     BEGIN{ok=0}
@@ -146,7 +133,6 @@ PY
     echo "No effective changes from FILE blocks."
     exit 1
   fi
-  # Apply the constructed diff so downstream tooling sees changes uniformly
   git apply --check patch.diff || true
   git apply patch.diff || true
   echo "Applied FILE blocks."
