@@ -1,12 +1,13 @@
 #!/bin/bash
 set -euo pipefail
 
+# Inputs
 ISSUE_NUMBER="$(jq -r .issue.number "$GITHUB_EVENT_PATH")"
 ISSUE_TITLE="$(jq -r .issue.title "$GITHUB_EVENT_PATH")"
-ISSUE_BODY="$(jq -r .issue.body "$GITHUB_EVENT_PATH")"
-
+ISSUE_BODY="$(jq -r .issue.body  "$GITHUB_EVENT_PATH")"
 echo "Agent triggered for issue #${ISSUE_NUMBER}: ${ISSUE_TITLE}"
 
+# Repo context
 REPO_FILES="$(git ls-files | sed -e 's/^/  - /')"
 if [[ -f README.md ]]; then
   README_TAIL="$(tail -n 20 README.md | sed -e 's/^/    /')"
@@ -14,6 +15,7 @@ else
   README_TAIL="    <README.md not found>"
 fi
 
+# Build prompt from YAML
 SYSTEM_PROMPT=""
 USER_TEMPLATE=""
 section=""
@@ -21,10 +23,8 @@ while IFS= read -r line || [[ -n "$line" ]]; do
   if [[ "$line" =~ ^system: ]]; then section="system"; continue
   elif [[ "$line" =~ ^user: ]]; then section="user"; continue; fi
   trimmed="${line#  }"
-  if [[ "$section" == "system" ]]; then
-    SYSTEM_PROMPT+="${trimmed}"$'\n'
-  elif [[ "$section" == "user" ]]; then
-    USER_TEMPLATE+="${trimmed}"$'\n'
+  if [[ "$section" == "system" ]]; then SYSTEM_PROMPT+="${trimmed}"$'\n'
+  elif [[ "$section" == "user" ]]; then USER_TEMPLATE+="${trimmed}"$'\n'
   fi
 done < ops/agent_prompt.yml
 
@@ -33,51 +33,79 @@ USER_PROMPT="${USER_PROMPT//\$ISSUE_BODY/$ISSUE_BODY}"
 USER_PROMPT="${USER_PROMPT//\$REPO_FILES/$REPO_FILES}"
 USER_PROMPT="${USER_PROMPT//\$README_TAIL/$README_TAIL}"
 
-FINAL_PROMPT="${SYSTEM_PROMPT}
-${USER_PROMPT}"
-
+# Model
 MODEL_NAME="qwen2.5-coder:7b-instruct"
-
-# Ensure Ollama daemon is responding
-curl -fsS http://127.0.0.1:11434/api/tags >/dev/null || {
-  echo "Ollama API not responding on 127.0.0.1:11434"; exit 1;
-}
-
-# Make sure model is present
 ollama pull "$MODEL_NAME" || true
 
-# Call Ollama HTTP API with stream:false to get clean JSON
-PROMPT_JSON="$(printf '%s' "$FINAL_PROMPT" | jq -Rs .)"
-curl -fsS -X POST http://127.0.0.1:11434/api/generate \
+# Health check
+curl -fsS http://127.0.0.1:11434/api/tags >/dev/null
+
+# Compose chat request (stream:false for clean JSON)
+SYSTEM_JSON=$(printf '%s' "$SYSTEM_PROMPT" | jq -Rs .)
+USER_JSON=$(printf '%s' "$USER_PROMPT"   | jq -Rs .)
+
+REQ=$(jq -n --arg model "$MODEL_NAME" \
+            --arg sys   "$SYSTEM_PROMPT" \
+            --arg usr   "$USER_PROMPT" \
+            --argjson opts '{"temperature":0,"num_ctx":8192}' '
+{
+  model: $model,
+  stream: false,
+  options: $opts,
+  messages: [
+    {role:"system", content:$sys},
+    {role:"user",   content:$usr}
+  ]
+}')
+
+# Call Ollama chat API
+curl -fsS -X POST http://127.0.0.1:11434/api/chat \
   -H 'Content-Type: application/json' \
-  -d "{\"model\":\"$MODEL_NAME\",\"prompt\":$PROMPT_JSON,\"stream\":false,\"options\":{\"temperature\":0,\"num_ctx\":8192}}" \
-  | jq -r '.response' > model.out
+  -d "$REQ" \
+  | jq -r '.message.content' > model.raw
 
-# Extract diff or FILE blocks
-extract_unified_diff() {
-  if grep -q '^```diff' model.out; then
-    awk '/^```diff/{f=1;next} /^```$/{f=0} f' model.out > patch.body || true
-  else
-    cp model.out patch.body
-  fi
-  awk '/^diff --git /{p=1} p' patch.body > patch.diff || true
-  [[ -s patch.diff ]] && grep -q '^diff --git ' patch.diff
-}
+# Sanitize control chars; keep TAB, LF, CR, and printable ASCII
+tr -cd '\11\12\15\40-\176' < model.raw > model.out
 
-apply_unified_diff() {
+# Extract between sentinels
+awk '
+  /^<<<BEGIN_PATCH$/ {in=1; next}
+  /^END_PATCH>>>$/   {if(in){exit 0}}
+  { if(in) print }
+  END{ if(in) exit 1 }
+' model.out > patch.payload || true
+
+if ! [[ -s patch.payload ]]; then
+  echo "Model output missing sentinels or empty payload. First lines:"
+  sed -n '1,60p' model.out
+  exit 1
+fi
+
+# Accept NO_CHANGES
+if grep -qx 'NO_CHANGES' patch.payload; then
+  echo "NO_CHANGES from model; nothing to apply."
+  exit 0
+fi
+
+# Try unified diff first
+if grep -q '^diff --git ' patch.payload; then
+  awk '/^diff --git /{p=1} p' patch.payload > patch.diff
   if git apply --check patch.diff 2>/dev/null; then
-    git apply patch.diff; echo "Patch applied."; return 0
+    git apply patch.diff
+    echo "Patch applied."
+  elif git apply --check --whitespace=fix patch.diff 2>/dev/null; then
+    git apply --whitespace=fix patch.diff
+    echo "Patch applied with whitespace fix."
+  elif git apply --check --3way patch.diff 2>/dev/null; then
+    git apply --3way patch.diff
+    echo "Patch applied with 3-way merge."
+  else
+    echo "Unified diff present but failed to apply. Aborting."
+    sed -n '1,80p' patch.diff
+    exit 1
   fi
-  if git apply --check --whitespace=fix patch.diff 2>/dev/null; then
-    git apply --whitespace=fix patch.diff; echo "Patch applied with whitespace fix."; return 0
-  fi
-  if git apply --check --3way patch.diff 2>/dev/null; then
-    git apply --3way patch.diff; echo "Patch applied with 3-way merge."; return 0
-  fi
-  return 1
-}
-
-apply_file_blocks() {
+else
+  # FALLBACK FILE blocks
   rm -f .agent.changed.list .agent.write.stream
   awk '
     BEGIN{ok=0}
@@ -90,7 +118,7 @@ apply_file_blocks() {
     }
     { if(infile){ content = content $0 "\n" } }
     END{ if(infile){exit 2}; exit ok?0:1 }
-  ' model.out || return 1
+  ' patch.payload || { echo "Malformed FILE blocks."; exit 1; }
 
   python3 - <<'PY' < .agent.write.stream
 import os,sys
@@ -114,26 +142,23 @@ PY
     done
   fi
   git diff > patch.diff || true
-  [[ -s patch.diff ]]
-}
-
-if grep -qx 'NO_CHANGES' model.out; then
-  echo "NO_CHANGES from model; nothing to apply."
-  exit 0
+  if ! [[ -s patch.diff ]]; then
+    echo "No effective changes from FILE blocks."
+    exit 1
+  fi
+  # Apply the constructed diff so downstream tooling sees changes uniformly
+  git apply --check patch.diff || true
+  git apply patch.diff || true
+  echo "Applied FILE blocks."
 fi
 
-if extract_unified_diff; then
-  if apply_unified_diff; then MODE="diff"; else echo "git apply failed for unified diff"; exit 1; fi
-else
-  if apply_file_blocks; then MODE="files"; echo "Applied FILE blocks and built working-tree diff."
-  else echo "Model output not usable (neither valid diff nor valid FILE blocks). First lines:"; sed -n '1,80p' model.out; exit 1; fi
-fi
-
+# Format (user-space)
 export PATH="$HOME/.local/bin:$PATH"
 python3 -m pip install --user --no-cache-dir black isort >/dev/null 2>&1 || true
 command -v isort >/dev/null 2>&1 && isort . || true
 command -v black  >/dev/null 2>&1 && black .  || true
 
+# Commit / push / PR
 BRANCH_NAME="agent-issue-${ISSUE_NUMBER}"
 git config user.name "Hushline Agent Bot"
 git config user.email "titles-peeps@users.noreply.github.com"
