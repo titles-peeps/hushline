@@ -37,33 +37,53 @@ if ! curl -fsS http://127.0.0.1:11434/api/tags >/dev/null; then
   curl -fsS -X POST \
     -H "Authorization: token ${AGENT_TOKEN}" \
     -H "Content-Type: application/json" \
-    -d "$(jq -n --arg body ":warning: Agent could not reach local Ollama (127.0.0.1:11434)." '{body:$body}')" \
+    -d "$(jq -n --arg body "Agent could not reach local Ollama (127.0.0.1:11434)." '{body:$body}')" \
     "${GITHUB_API}/repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" >/dev/null || true
   exit 0
 fi
 
-# Pull model if needed (non-fatal if already present)
 ollama pull "$MODEL_NAME" || true
 
-# Call Ollama chat API (expect raw unified diff or NO_CHANGES)
-REQUEST_JSON=$(jq -n \
-  --arg model "$MODEL_NAME" \
-  --arg sys "$SYSTEM_PROMPT" \
-  --arg usr "$USER_PROMPT" \
-  --argjson opts '{"temperature":0,"num_ctx":8192}' \
-  '{model:$model,stream:false,options:$opts,
-    messages:[{role:"system",content:$sys},{role:"user",content:$usr}]}')
+chat_once() {
+  local sys="$1" usr="$2"
+  jq -n --arg model "$MODEL_NAME" --arg sys "$sys" --arg usr "$usr" \
+        --argjson opts '{"temperature":0,"num_ctx":8192}' \
+        '{model:$model,stream:false,options:$opts,
+          messages:[{role:"system",content:$sys},{role:"user",content:$usr}]}' \
+  | curl -fsS -X POST http://127.0.0.1:11434/api/chat \
+      -H 'Content-Type: application/json' \
+      -d @- \
+  | jq -r '.message.content // .response // ""'
+}
 
-RAW_RESPONSE="$(curl -fsS -X POST http://127.0.0.1:11434/api/chat \
-  -H 'Content-Type: application/json' \
-  -d "$REQUEST_JSON" \
-  | jq -r '.message.content // .response // ""')"
+sanitize_ascii() { tr -cd '\11\12\15\40-\176'; }
 
-# Sanitize to printable text
-RESP="$(printf '%s' "$RAW_RESPONSE" | tr -cd '\11\12\15\40-\176')"
+extract_diff() {
+  # Accept raw diff or ```diff fenced
+  if grep -q '^```diff' <<<"$1"; then
+    awk '/^```diff/{f=1;next} /^```$/{f=0} f' <<<"$1"
+  else
+    printf '%s' "$1"
+  fi | awk '/^diff --git /{p=1} p'
+}
 
-# Quick accept: NO_CHANGES -> comment and exit green
-if printf '%s' "$RESP" | grep -qx 'NO_CHANGES'; then
+apply_diff_with_fallbacks() {
+  local diff_file="$1"
+  if git apply --check "$diff_file" 2>/dev/null; then
+    git apply "$diff_file"; return 0
+  fi
+  if git apply --check --whitespace=fix "$diff_file" 2>/dev/null; then
+    git apply --whitespace=fix "$diff_file"; return 0
+  fi
+  if git apply --check --3way "$diff_file" 2>/dev/null; then
+    git apply --3way "$diff_file"; return 0
+  fi
+  return 1
+}
+
+# Pass 1: ask for unified diff
+RAW1="$(chat_once "$SYSTEM_PROMPT" "$USER_PROMPT" | sanitize_ascii)"
+if printf '%s' "$RAW1" | grep -qx 'NO_CHANGES'; then
   curl -fsS -X POST \
     -H "Authorization: token ${AGENT_TOKEN}" \
     -H "Content-Type: application/json" \
@@ -72,53 +92,85 @@ if printf '%s' "$RESP" | grep -qx 'NO_CHANGES'; then
   exit 0
 fi
 
-# Extract unified diff
-# Accept either raw unified diff or a single ```diff fenced block
-if printf '%s' "$RESP" | grep -q '^```diff'; then
-  awk '/^```diff/{f=1;next} /^```$/{f=0} f' <<<"$RESP" > patch.body || true
+DIFF1="$(extract_diff "$RAW1")"
+printf '%s' "$DIFF1" > patch.diff || true
+
+if [[ -s patch.diff ]] && grep -q '^diff --git ' patch.diff; then
+  if apply_diff_with_fallbacks patch.diff; then
+    applied_mode="diff"
+  else
+    # Capture target paths from failed diff for the FILE-block retry prompt
+    mapfile -t TARGETS < <(grep -E '^diff --git a/.* b/.*$' patch.diff | awk '{print $3}' | sed 's|b/||')
+    applied_mode=""
+  fi
 else
-  printf '%s' "$RESP" > patch.body
+  TARGETS=()
+  applied_mode=""
 fi
 
-# Keep from first "diff --git"
-awk '/^diff --git /{p=1} p' patch.body > patch.diff || true
+# Pass 2 (only if diff failed): ask for FILE blocks with full contents for specific files
+if [[ -z "${applied_mode:-}" ]]; then
+  # Build a strict follow-up asking for FILE blocks for the paths in TARGETS (if any).
+  TARGET_HINT=""
+  if ((${#TARGETS[@]} > 0)); then
+    TARGET_HINT=$'\nFiles to return in full (exact paths):\n'
+    for p in "${TARGETS[@]}"; do TARGET_HINT+=" - ${p}\n"; done
+  fi
 
-if ! [[ -s patch.diff ]] || ! grep -q '^diff --git ' patch.diff; then
-  # Comment diagnostic and exit green
-  head_preview="$(printf '%s' "$RESP" | sed -n '1,60p')"
+  STRICT_USER=$'The previous diff did not apply.\nReturn FULL FILE CONTENTS ONLY using FILE blocks, one per file, no prose:\n'\
+$'FILE: <relative/path>\n-----BEGIN FILE-----\n<entire file content>\n-----END FILE-----\n'\
+"${TARGET_HINT}"
+
+  RAW2="$(chat_once "$SYSTEM_PROMPT" "$STRICT_USER" | sanitize_ascii)"
+  printf '%s' "$RAW2" > model.raw
+
+  # Extract FILE blocks and write files
+  python3 - <<'PY' || true
+import os, sys, re, subprocess, json
+raw = open('model.raw','r',encoding='utf-8',errors='surrogatepass').read()
+raw = raw.replace('\r\n','\n').replace('\r','\n')
+pat = re.compile(
+    r'^FILE:\s+([^\n]+)\n-----BEGIN FILE-----\n(.*?)\n-----END FILE-----\n?',
+    re.S|re.M
+)
+blocks = pat.findall(raw)
+if not blocks:
+    sys.exit(10)
+changed=set()
+for path, content in blocks:
+    path = path.strip()
+    if not path or path.startswith('/') or '..' in path.split('/'):
+        continue
+    d = os.path.dirname(path)
+    if d and not os.path.isdir(d):
+        os.makedirs(d, exist_ok=True)
+    with open(path,'wb') as f:
+        f.write(content.encode('utf-8','surrogatepass'))
+    changed.add(path)
+for p in sorted(changed):
+    subprocess.run(["git","add","-N","--",p], check=False)
+diff = subprocess.run(["git","diff"], capture_output=True, text=True).stdout
+open('patch.from_files.diff','w',encoding='utf-8',errors='surrogatepass').write(diff)
+PY
+
+  if [[ -s patch.from_files.diff ]]; then
+    git apply --check patch.from_files.diff 2>/dev/null || true
+    git apply patch.from_files.diff 2>/dev/null || true
+    applied_mode="files"
+  fi
+fi
+
+# If nothing applied, comment and exit green
+if [[ -z "${applied_mode:-}" ]]; then
+  preview="$(sed -n '1,80p' patch.diff 2>/dev/null || true)"
+  [[ -z "$preview" ]] && preview="$(sed -n '1,60p' model.raw 2>/dev/null || true)"
   curl -fsS -X POST \
     -H "Authorization: token ${AGENT_TOKEN}" \
     -H "Content-Type: application/json" \
-    -d "$(jq -n --arg b "Agent output did not contain a usable unified diff. First lines:\n\n\`\`\`\n$head_preview\n\`\`\`" '{body:$b}')" \
+    -d "$(jq -n --arg b "Agent could not apply changes from the model. Diagnostic preview:\n\`\`\`\n$preview\n\`\`\`" '{body:$b}')" \
     "${GITHUB_API}/repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" >/dev/null || true
   exit 0
 fi
-
-# Try to apply the patch with fallbacks
-apply_ok=0
-if git apply --check patch.diff 2>/dev/null; then
-  git apply patch.diff; apply_ok=1
-elif git apply --check --whitespace=fix patch.diff 2>/dev/null; then
-  git apply --whitespace=fix patch.diff; apply_ok=1
-elif git apply --check --3way patch.diff 2>/dev/null; then
-  git apply --3way patch.diff; apply_ok=1
-fi
-
-if [[ "$apply_ok" != "1" ]]; then
-  fail_preview="$(sed -n '1,80p' patch.diff)"
-  curl -fsS -X POST \
-    -H "Authorization: token ${AGENT_TOKEN}" \
-    -H "Content-Type: application/json" \
-    -d "$(jq -n --arg b "Agent produced a diff but it did not apply cleanly.\n\nFirst lines:\n\`\`\`diff\n$fail_preview\n\`\`\`" '{body:$b}')" \
-    "${GITHUB_API}/repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" >/dev/null || true
-  exit 0
-fi
-
-# Optional formatting (best-effort, silent)
-export PATH="$HOME/.local/bin:$PATH"
-python3 -m pip install --user --no-cache-dir black isort >/dev/null 2>&1 || true
-command -v isort >/dev/null 2>&1 && isort . >/dev/null 2>&1 || true
-command -v black  >/dev/null 2>&1 && black .  >/dev/null 2>&1 || true
 
 # Commit, push, open PR
 BRANCH_NAME="agent-issue-${ISSUE_NUMBER}"
@@ -131,7 +183,7 @@ if git diff --cached --quiet; then
   curl -fsS -X POST \
     -H "Authorization: token ${AGENT_TOKEN}" \
     -H "Content-Type: application/json" \
-    -d "$(jq -n --arg b "Agent patch applied but no staged changes were detected; nothing to commit." '{body:$b}')" \
+    -d "$(jq -n --arg b "Agent applied edits but nothing was staged; aborting PR." '{body:$b}')" \
     "${GITHUB_API}/repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" >/dev/null || true
   exit 0
 fi
