@@ -1,8 +1,7 @@
-name: Agent Automation
+name: Agent Automation (MVP)
 on:
   issues:
     types: [labeled]
-
 jobs:
   run-agent:
     if: ${{ github.event.label.name == 'agent' }}
@@ -11,43 +10,15 @@ jobs:
       contents: write
       issues: write
       pull-requests: write
-    env:
-      OLLAMA_NO_TTY: "1"
-      TERM: dumb
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Ensure user-space Python tools and jq
+      - name: Ensure jq and Python exist
         run: |
-          python3 -m pip install --user --upgrade pip
-          python3 -m pip install --user black isort
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          if ! command -v jq >/dev/null 2>&1; then
-            ARCH="$(uname -m)"
-            case "$ARCH" in
-              x86_64)  JQ_URL="https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64" ;;
-              aarch64|arm64) JQ_URL="https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-arm64" ;;
-              *) echo "Unsupported arch: $ARCH" ; exit 1 ;;
-            esac
-            mkdir -p "$RUNNER_TEMP/bin"
-            curl -fsSL "$JQ_URL" -o "$RUNNER_TEMP/bin/jq"
-            chmod +x "$RUNNER_TEMP/bin/jq"
-            echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
-          fi
-
-      - name: Verify prerequisites
-        run: |
-          git --version
-          jq --version
-          black --version
-          isort --version
-          command -v ollama && ollama --version || (echo "ollama not on PATH" && exit 1)
-          ollama list || true
-
-      - name: Run agent
+          command -v jq >/dev/null 2>&1 || { echo "jq required"; exit 1; }
+          command -v python3 >/dev/null 2>&1 || { echo "python3 required"; exit 1; }
+      - name: Run MVP agent (no LLM; FILE blocks only)
         env:
           AGENT_TOKEN: ${{ secrets.AGENT_TOKEN }}
         run: |
-          export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
           bash ops/agent.sh

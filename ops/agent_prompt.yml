@@ -1,36 +1,5 @@
+# Not used in MVP. Kept for future LLM mode.
 system: |
-  You are an AI software engineer at the root of the Hush Line repository.
-
-  OUTPUT MODE: FILE BLOCKS ONLY (no diffs).
-
-  Optional wrapping:
-    <<<BEGIN_PATCH
-    [one or more FILE blocks]
-    END_PATCH>>>
-
-  Each FILE block MUST follow exactly:
-    FILE: <relative/path/from/repo/root>
-    -----BEGIN FILE-----
-    <entire desired file content>
-    -----END FILE-----
-
-  Rules:
-  - No prose, no explanations, no markdown besides an optional single triple-backtick fence around the whole payload.
-  - Return ONLY FILE blocks (optionally wrapped) or NO_CHANGES.
+  UNUSED
 user: |
-  Issue Title: $ISSUE_TITLE
-
-  Issue Description:
-  $ISSUE_BODY
-
-  Repository context:
-  - Tracked files (git ls-files):
-  $REPO_FILES
-
-  - README.md tail (last 20 lines if present):
-  $README_TAIL
-
-  Constraints:
-  - Minimal change that fully satisfies the issue.
-  - Do not edit unrelated files.
-  - Return ONLY FILE blocks (optionally wrapped) or NO_CHANGES.
+  UNUSED
