@@ -7,7 +7,7 @@
   --color-border-light: rgba(0, 0, 0, 0.1);
   --color-border-dark: #787878;
   --color-border-dark-1: #505050;
-  --color-brand: oklch(48.55% 0.222 304.47);
+  --color-brand: #000;
   --color-brand-min-contrast: oklch(
     from var(--color-brand) clamp(0.1, l, 0.6) c h
   );
